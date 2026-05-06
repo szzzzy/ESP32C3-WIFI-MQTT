@@ -1,0 +1,20 @@
+# Build output
+build/
+build_*/
+
+# Managed components (fetched by idf.py)
+managed_components/
+
+# IDE
+.vscode/
+
+# Python
+__pycache__/
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+
+# OS
+Thumbs.db
+Desktop.ini
