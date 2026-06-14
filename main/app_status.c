@@ -15,7 +15,7 @@ static const char *TAG = APP_TAG;
 /**
  * @brief 全局运行状态快照结构体。
  *
- * 该结构体汇总了 WiFi/MQTT/SD/UART/协议 五个子系统的布尔状态标志
+ * 该结构体汇总了 WiFi/MQTT/UART/协议 四个子系统的布尔状态标志
  * 和运行计数器，统一由互斥锁 s_status_mutex 保护。
  *
  * 布尔字段由各模块的状态变化回调更新；计数器字段由"快速路径"中的
@@ -31,11 +31,6 @@ typedef struct {
     bool mqtt_connected;    /**< MQTT 是否已连接 broker */
     bool mqtt_subscribed;   /**< MQTT 是否已成功订阅下行命令主题 */
 
-    /* ---- SD ---- */
-    bool sd_bus_ready;      /**< SD SPI 总线是否已初始化 */
-    bool sd_monitor_running;/**< SD 热插拔监控任务是否在运行 */
-    bool sd_mounted;        /**< SD 卡文件系统是否已挂载 */
-
     /* ---- UART ---- */
     bool uart_ready;         /**< UART 驱动是否已初始化 */
     bool uart_tx_task_running; /**< UART 发送任务是否在运行 */
@@ -44,10 +39,12 @@ typedef struct {
     /* ---- 协议解析 ---- */
     bool last_protocol_ok;  /**< 最近一帧协议数据是否解析成功 */
     char last_frame_type;   /**< 最近一帧的类型（M/T/?/!），初始化为 '-' */
+    uint32_t last_frame_ms; /**< 最近一帧 UART 接收完成时的系统毫秒时间戳 */
 
     /* ---- 计数器 ---- */
     uint32_t uart_rx_lines;      /**< UART 接收到的完整文本行总数 */
     uint32_t uart_rx_drops;      /**< UART 接收溢出丢弃的行数 */
+    uint32_t uart_rx_overflows;  /**< UART 行缓冲区溢出事件次数 */
     uint32_t uart_tx_queued;     /**< UART 发送队列已入队的消息数 */
     uint32_t uart_tx_ok;         /**< UART 发送成功次数 */
     uint32_t uart_tx_fail;       /**< UART 发送失败次数 */
@@ -58,10 +55,8 @@ typedef struct {
 
     uint32_t protocol_ok;        /**< 协议帧解析成功次数 */
     uint32_t protocol_error;     /**< 协议帧解析失败次数 */
+    uint32_t forward_fail;       /**< 转发失败次数（JSON 构建或 MQTT 发布失败） */
 
-    uint32_t sd_write_ok;        /**< SD 日志写入成功次数 */
-    uint32_t sd_write_fail;      /**< SD 日志写入失败次数 */
-    uint32_t sd_drop;            /**< SD 日志丢弃条数（队列满或 SD 未就绪） */
 } app_status_snapshot_t;
 
 /** @brief 保护全局状态快照读写线程安全的 FreeRTOS 互斥锁 */
@@ -93,7 +88,6 @@ static void app_status_copy_snapshot(app_status_snapshot_t *snapshot);
 /* ---- 以下四个函数将布尔状态字段映射为可读的短字符串，用于日志输出 ---- */
 static const char *wifi_state_string(const app_status_snapshot_t *snapshot);
 static const char *mqtt_state_string(const app_status_snapshot_t *snapshot);
-static const char *sd_state_string(const app_status_snapshot_t *snapshot);
 static const char *uart_state_string(const app_status_snapshot_t *snapshot);
 static const char *protocol_state_string(const app_status_snapshot_t *snapshot);
 
@@ -154,33 +148,32 @@ void app_status_log_snapshot(const char *reason)
     app_status_copy_snapshot(&snapshot);
 
     ESP_LOGI(TAG,
-             "STATUS[%s] wifi=%s mqtt=%s sd=%s uart=%s protocol=%s(last=%c)",
+             "STATUS[%s] wifi=%s mqtt=%s uart=%s protocol=%s(last=%c)",
              label,
              wifi_state_string(&snapshot),
              mqtt_state_string(&snapshot),
-             sd_state_string(&snapshot),
              uart_state_string(&snapshot),
              protocol_state_string(&snapshot),
              snapshot.last_frame_type);
     ESP_LOGI(TAG,
-             "STATUS[%s] uart_rx=%lu uart_drop=%lu uart_tx_queued=%lu uart_tx_ok=%lu uart_tx_fail=%lu",
+             "STATUS[%s] uart_rx=%lu uart_drop=%lu uart_overflow=%lu uart_tx_queued=%lu uart_tx_ok=%lu uart_tx_fail=%lu",
              label,
              (unsigned long)snapshot.uart_rx_lines,
              (unsigned long)snapshot.uart_rx_drops,
+             (unsigned long)snapshot.uart_rx_overflows,
              (unsigned long)snapshot.uart_tx_queued,
              (unsigned long)snapshot.uart_tx_ok,
              (unsigned long)snapshot.uart_tx_fail);
     ESP_LOGI(TAG,
-             "STATUS[%s] mqtt_cmd=%lu mqtt_pub_ok=%lu mqtt_pub_fail=%lu protocol_ok=%lu protocol_err=%lu sd_write_ok=%lu sd_write_fail=%lu sd_drop=%lu",
+             "STATUS[%s] mqtt_cmd=%lu mqtt_pub_ok=%lu mqtt_pub_fail=%lu forward_fail=%lu protocol_ok=%lu protocol_err=%lu last_frame_ms=%lu",
              label,
              (unsigned long)snapshot.mqtt_command_count,
              (unsigned long)snapshot.mqtt_publish_ok,
              (unsigned long)snapshot.mqtt_publish_fail,
+             (unsigned long)snapshot.forward_fail,
              (unsigned long)snapshot.protocol_ok,
              (unsigned long)snapshot.protocol_error,
-             (unsigned long)snapshot.sd_write_ok,
-             (unsigned long)snapshot.sd_write_fail,
-             (unsigned long)snapshot.sd_drop);
+             (unsigned long)snapshot.last_frame_ms);
 }
 
 void app_status_set_wifi_started(bool started)
@@ -233,23 +226,6 @@ void app_status_set_mqtt_subscribed(bool subscribed)
                          subscribed ? "mqtt_subscribed" : "mqtt_unsubscribed");
 }
 
-void app_status_set_sd_bus_ready(bool ready)
-{
-    set_flag_with_reason(&s_status.sd_bus_ready, ready, ready ? "sd_bus_ready" : "sd_bus_not_ready");
-}
-
-void app_status_set_sd_monitor_running(bool running)
-{
-    set_flag_with_reason(&s_status.sd_monitor_running,
-                         running,
-                         running ? "sd_monitor_started" : "sd_monitor_stopped");
-}
-
-void app_status_set_sd_mounted(bool mounted)
-{
-    set_flag_with_reason(&s_status.sd_mounted, mounted, mounted ? "sd_mounted" : "sd_unmounted");
-}
-
 void app_status_set_uart_ready(bool ready)
 {
     set_flag_with_reason(&s_status.uart_ready, ready, ready ? "uart_ready" : "uart_not_ready");
@@ -289,6 +265,30 @@ void app_status_note_uart_rx_drop(void)
 
     if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
         s_status.uart_rx_drops++;
+        xSemaphoreGive(s_status_mutex);
+    }
+}
+
+void app_status_note_uart_rx_overflow(void)
+{
+    if (s_status_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
+        s_status.uart_rx_overflows++;
+        xSemaphoreGive(s_status_mutex);
+    }
+}
+
+void app_status_set_last_frame_ms(uint32_t ms)
+{
+    if (s_status_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
+        s_status.last_frame_ms = ms;
         xSemaphoreGive(s_status_mutex);
     }
 }
@@ -349,30 +349,14 @@ void app_status_note_mqtt_command(void)
     }
 }
 
-void app_status_note_sd_write(bool ok)
+void app_status_note_forward_fail(void)
 {
     if (s_status_mutex == NULL) {
         return;
     }
 
     if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
-        if (ok) {
-            s_status.sd_write_ok++;
-        } else {
-            s_status.sd_write_fail++;
-        }
-        xSemaphoreGive(s_status_mutex);
-    }
-}
-
-void app_status_note_sd_drop(uint32_t count)
-{
-    if (count == 0U || s_status_mutex == NULL) {
-        return;
-    }
-
-    if (xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
-        s_status.sd_drop += count;
+        s_status.forward_fail++;
         xSemaphoreGive(s_status_mutex);
     }
 }
@@ -437,7 +421,9 @@ static void app_status_task(void *arg)
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(APP_STATUS_REPORT_PERIOD_MS));
+#if APP_VERBOSE_LOGGING
         app_status_log_snapshot("periodic");
+#endif
     }
 }
 
@@ -484,29 +470,6 @@ static const char *mqtt_state_string(const app_status_snapshot_t *snapshot)
     }
 
     return snapshot->mqtt_started ? "starting" : "stopped";
-}
-
-/**
- * @brief 将 SD 卡布尔状态转为单行可读字符串。
- *
- * 优先级: mounted → "ok"; monitor_running + bus_ready → "waiting_card";
- *         bus_ready → "ready"; 否则 → "stopped"
- */
-static const char *sd_state_string(const app_status_snapshot_t *snapshot)
-{
-    if (snapshot->sd_mounted) {
-        return "ok";
-    }
-
-    if (snapshot->sd_monitor_running && snapshot->sd_bus_ready) {
-        return "waiting_card";
-    }
-
-    if (snapshot->sd_bus_ready) {
-        return "ready";
-    }
-
-    return "stopped";
 }
 
 /**

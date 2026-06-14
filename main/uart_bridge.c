@@ -1,5 +1,7 @@
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -7,6 +9,7 @@
 #include "freertos/task.h"
 
 #include "driver/uart.h"
+#include "esp_timer.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -111,7 +114,7 @@ esp_err_t uart_bridge_start_tx_task(void)
 
     if (xTaskCreate(uart_tx_task,
                     "uart_tx_task",
-                    UART_TASK_STACK_SIZE,
+                    UART_TX_TASK_STACK_SIZE,
                     NULL,
                     UART_TASK_PRIORITY,
                     &s_uart_tx_task_handle) != pdPASS) {
@@ -146,7 +149,7 @@ esp_err_t uart_bridge_start_rx_task(uart_bridge_line_handler_t handler, void *ct
 
     if (xTaskCreate(uart_rx_task,
                     "uart_rx_task",
-                    UART_TASK_STACK_SIZE,
+                    UART_RX_TASK_STACK_SIZE,
                     NULL,
                     UART_TASK_PRIORITY,
                     &s_uart_rx_task_handle) != pdPASS) {
@@ -204,7 +207,7 @@ void uart_bridge_queue_command(const char *payload, int payload_len)
     }
 
     app_status_note_uart_tx_queued();
-    ESP_LOGI(TAG,
+    ESP_LOGI_VERBOSE(TAG,
              "MQTT->UART queued (%d bytes%s): %.*s",
              payload_len,
              msg.append_newline ? " + newline" : "",
@@ -223,11 +226,19 @@ void uart_bridge_queue_command(const char *payload, int payload_len)
 static void uart_rx_task(void *arg)
 {
     uint8_t ch;
-    char line[UART_BUF_SIZE];
+    char *line = malloc(UART_LINE_BUF_SIZE);
     int idx = 0;
     bool discarding_line = false;
 
     (void)arg;
+
+    if (line == NULL) {
+        ESP_LOGE(TAG, "No memory for UART RX line buffer (%d bytes)", UART_LINE_BUF_SIZE);
+        app_status_note_uart_rx_overflow();
+        app_status_set_uart_rx_task_running(false);
+        vTaskDelete(NULL);
+        return;
+    }
 
     while (1) {
         int len = uart_read_bytes(UART_PORT, &ch, 1, pdMS_TO_TICKS(100));
@@ -245,28 +256,34 @@ static void uart_rx_task(void *arg)
         }
 
         if (ch == '\n') {
+            uint32_t rx_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
             line[idx] = '\0';
 
             if (idx > 0 && line[idx - 1] == '\r') {
                 line[idx - 1] = '\0';
             }
 
-            ESP_LOGI(TAG,
-                     "UART RX line (%u bytes): %s",
+            ESP_LOGI_VERBOSE(TAG,
+                     "UART RX line (%u bytes) @ %lu ms: %s",
                      (unsigned int)strlen(line),
+                     (unsigned long)rx_ms,
                      line);
             app_status_note_uart_rx_line();
+            app_status_set_last_frame_ms(rx_ms);
 
             if (s_line_handler != NULL) {
-                s_line_handler(line, s_line_handler_ctx);
+                s_line_handler(line, rx_ms, s_line_handler_ctx);
             }
 
             idx = 0;
-        } else if (idx < UART_BUF_SIZE - 1) {
+        } else if (idx < UART_LINE_BUF_SIZE - 1) {
             line[idx++] = (char)ch;
         } else {
-            ESP_LOGW(TAG, "UART RX line too long, drop until newline");
+            ESP_LOGW(TAG, "UART RX line too long (%d max), discarding until newline",
+                     UART_LINE_BUF_SIZE);
             app_status_note_uart_rx_drop();
+            app_status_note_uart_rx_overflow();
             discarding_line = true;
             idx = 0;
         }
@@ -313,7 +330,7 @@ static void uart_tx_task(void *arg)
         }
 
         app_status_note_uart_tx_result(true);
-        ESP_LOGI(TAG,
+        ESP_LOGI_VERBOSE(TAG,
                  "UART TX done (%u bytes%s): %.*s",
                  (unsigned int)msg.len,
 #if UART_APPEND_NEWLINE_ON_MQTT_COMMAND

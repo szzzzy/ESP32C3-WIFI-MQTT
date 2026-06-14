@@ -6,7 +6,7 @@ This script uses MQTT 3.1.1 over plain TCP and only depends on the Python
 standard library. The default payload template assumes the STM32 time-set
 command is:
 
-    T,YYYYMMDD,HHMMSS
+    SETTIME YYYYMMDD HHMMSS
 
 If the MCU expects a different frame, pass --template to override it.
 """
@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 
 DEFAULT_BROKER_URI = "mqtt://172.20.10.4"
 DEFAULT_TOPIC = "pulseox/cmd"
-DEFAULT_TEMPLATE = "T,{date},{time}"
+DEFAULT_TEMPLATE = "SETTIME {date} {time}"
 
 DEFINE_RE = re.compile(
     r'#define\s+(MQTT_BROKER_URI|MQTT_COMMAND_TOPIC)\s+"([^"]+)"'
@@ -46,7 +46,7 @@ def discover_firmware_defaults(repo_root: pathlib.Path) -> Dict[str, str]:
         "broker_uri": DEFAULT_BROKER_URI,
         "topic": DEFAULT_TOPIC,
     }
-    source_path = repo_root / "main" / "hello_world.c"
+    source_path = repo_root / "main" / "app_config.h"
 
     try:
         source_text = source_path.read_text(encoding="utf-8", errors="ignore")
@@ -82,7 +82,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--template",
         default=DEFAULT_TEMPLATE,
-        help="Payload template. Supported placeholders: {date}, {time}, {iso}.",
+        help=(
+            "Payload template. Supported placeholders: "
+            "{date}, {date_dashed}, {time}, {time_colon}, {iso}."
+        ),
     )
     parser.add_argument(
         "--date",
@@ -146,7 +149,9 @@ def build_time_tokens(args: argparse.Namespace) -> Dict[str, str]:
 
     return {
         "date": date_value,
+        "date_dashed": f"{date_value[:4]}-{date_value[4:6]}-{date_value[6:8]}",
         "time": time_value,
+        "time_colon": f"{time_value[:2]}:{time_value[2:4]}:{time_value[4:6]}",
         "iso": now.isoformat(timespec="seconds"),
     }
 
@@ -157,7 +162,7 @@ def render_payload(template: str, tokens: Dict[str, str]) -> str:
     except KeyError as exc:
         raise ValueError(
             f"unknown template placeholder: {exc.args[0]!r}; "
-            "supported placeholders are {date}, {time}, {iso}"
+            "supported placeholders are {date}, {date_dashed}, {time}, {time_colon}, {iso}"
         ) from exc
 
 

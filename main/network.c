@@ -1,12 +1,15 @@
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 
 #include "mqtt_client.h"
@@ -31,6 +34,32 @@ static EventGroupHandle_t s_wifi_event_group = NULL;
 /** @brief MQTT 客户端全局句柄，初始为 NULL，由 network_start_mqtt() 创建 */
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 
+static const char *SELFTEST_MEASUREMENT_LINE =
+    "M,1,20260613,120000,"
+    "111111,222222,1800,1,"
+    "1,72,"
+    "1,98,"
+    "1,18,"
+    "1,833,"
+    "1,830,42,35,"
+    "0,5,"
+    "30,40,75,0,"
+    "1,1234,567,218,"
+    "85,1,123,45,5000,3000,"
+    "1,920,1,"
+    "50000,1500,800,200,3000,2500,3,2,"
+    "0,0,0,0,0,0,"
+    "100,5,0,2,123456,50,10,0,"
+    "1,1,1,1,3,0,1024000,"
+    "500,123457,0,1,"
+    "1,71,845,0,123458,-12,"
+    "1,245,"
+    "1000,0,0,0,0,"
+    "0,0,0,0,0,5,1,"
+    "3,2,1,0,"
+    "512,256,128,64,"
+    "999,500";
+
 /* ---- 内部前置声明 ---- */
 static void init_nvs_flash(void);
 static void wifi_init_sta(void);
@@ -44,6 +73,12 @@ static void mqtt_event_handler(void *handler_args,
                                void *event_data);
 static void log_mqtt_error_details(esp_mqtt_event_handle_t event);
 static bool mqtt_event_matches_topic(esp_mqtt_event_handle_t event, const char *topic);
+static bool mqtt_event_payload_equals(esp_mqtt_event_handle_t event, const char *payload);
+static bool mqtt_event_json_command_equals(esp_mqtt_event_handle_t event, const char *command);
+static bool json_string_field_equals(const char *json, const char *field_name, const char *expected);
+static const char *skip_json_ws(const char *p);
+static void publish_selftest_measurement(void);
+static void selftest_publish_task(void *arg);
 static const char *protocol_result_to_string(stm32_protocol_result_t result);
 
 /**
@@ -115,56 +150,73 @@ void network_start_mqtt(void)
  * 转换为 JSON，最后发送到预定义主题。任何一步失败都会记录日志并安全返回。
  *
  * @param line 已完成按行分包的串口原始文本。
+ * @param rx_ms 该行被接收时的系统毫秒时间戳。
  */
-void network_publish_uart_line(const char *line)
+bool network_publish_json_payload(const char *json_payload)
 {
     EventBits_t bits;
-    char *json_payload;
     int msg_id;
+
+    if (json_payload == NULL || json_payload[0] == '\0') {
+        return false;
+    }
+
+    if (s_mqtt_client == NULL) {
+        ESP_LOGW(TAG, "MQTT client not created yet");
+        app_status_note_mqtt_publish(false);
+        app_status_note_forward_fail();
+        return false;
+    }
+
+    bits = xEventGroupGetBits(s_wifi_event_group);
+    if ((bits & APP_MQTT_CONNECTED_BIT) == 0) {
+        ESP_LOGW(TAG, "MQTT not ready, drop JSON payload");
+        app_status_note_mqtt_publish(false);
+        app_status_note_forward_fail();
+        return false;
+    }
+
+    msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_PUBLISH_TOPIC, json_payload, 0, 1, 0);
+    if (msg_id >= 0) {
+        ESP_LOGI_VERBOSE(TAG, "Published to MQTT topic=%s, msg_id=%d", MQTT_PUBLISH_TOPIC, msg_id);
+        app_status_note_mqtt_publish(true);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Failed to publish JSON payload to topic=%s", MQTT_PUBLISH_TOPIC);
+    app_status_note_mqtt_publish(false);
+    app_status_note_forward_fail();
+    return false;
+}
+
+void network_publish_uart_line(const char *line, uint32_t rx_ms)
+{
+    char *json_payload;
     stm32_protocol_result_t protocol_result = STM32_PROTOCOL_RESULT_NONE;
 
     if (line == NULL || line[0] == '\0') {
         return;
     }
 
-    ESP_LOGI(TAG, "UART->MQTT raw line (%u bytes): %s", (unsigned int)strlen(line), line);
+    ESP_LOGI_VERBOSE(TAG, "UART->MQTT raw line (%u bytes) @ %lu ms: %s",
+             (unsigned int)strlen(line), (unsigned long)rx_ms, line);
 
-    if (s_mqtt_client == NULL) {
-        ESP_LOGW(TAG, "MQTT client not created yet");
-        app_status_note_mqtt_publish(false);
-        return;
-    }
-
-    bits = xEventGroupGetBits(s_wifi_event_group);
-    if ((bits & APP_MQTT_CONNECTED_BIT) == 0) {
-        ESP_LOGW(TAG, "MQTT not ready, drop UART line: %s", line);
-        app_status_note_mqtt_publish(false);
-        return;
-    }
-
-    json_payload = stm32_protocol_build_publish_json(line, &protocol_result);
+    json_payload = stm32_protocol_build_publish_json(line, rx_ms, &protocol_result);
     app_status_note_protocol_result(protocol_result);
     if (json_payload == NULL) {
         ESP_LOGW(TAG, "Failed to build JSON payload for UART line");
         app_status_note_mqtt_publish(false);
+        app_status_note_forward_fail();
         return;
     }
 
-    ESP_LOGI(TAG,
-             "UART->MQTT parsed result=%s payload=%s",
+    ESP_LOGI_VERBOSE(TAG,
+             "UART->MQTT parsed result=%s payload_len=%u",
              protocol_result_to_string(protocol_result),
-             json_payload);
+             (unsigned int)strlen(json_payload));
 
-    msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_PUBLISH_TOPIC, json_payload, 0, 1, 0);
+    (void)network_publish_json_payload(json_payload);
     free(json_payload);
-
-    if (msg_id >= 0) {
-        ESP_LOGI(TAG, "Published to MQTT topic=%s, msg_id=%d", MQTT_PUBLISH_TOPIC, msg_id);
-        app_status_note_mqtt_publish(true);
-    } else {
-        ESP_LOGW(TAG, "Failed to publish UART line to topic=%s", MQTT_PUBLISH_TOPIC);
-        app_status_note_mqtt_publish(false);
-    }
 }
 
 /**
@@ -309,10 +361,14 @@ static void mqtt_event_handler(void *handler_args,
         case MQTT_EVENT_SUBSCRIBED:
             ESP_LOGI(TAG, "MQTT subscription acknowledged, msg_id=%d", event->msg_id);
             app_status_set_mqtt_subscribed(true);
+            esp_log_level_set("wifi", ESP_LOG_WARN);
+            esp_log_level_set("mqtt_client", ESP_LOG_WARN);
+            esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
+            esp_log_level_set("phy_init", ESP_LOG_WARN);
             break;
 
         case MQTT_EVENT_DATA:
-            ESP_LOGI(TAG,
+            ESP_LOGI_VERBOSE(TAG,
                      "MQTT RX topic=%.*s payload=(%d bytes) %.*s",
                      event->topic_len,
                      event->topic != NULL ? event->topic : "",
@@ -339,7 +395,23 @@ static void mqtt_event_handler(void *handler_args,
             }
 
             app_status_note_mqtt_command();
-            ESP_LOGI(TAG, "MQTT->UART forwarding command");
+
+            if (mqtt_event_payload_equals(event, MQTT_SELFTEST_COMMAND) ||
+                mqtt_event_json_command_equals(event, MQTT_SELFTEST_COMMAND)) {
+                ESP_LOGI(TAG, "MQTT self-test command received");
+                if (xTaskCreate(selftest_publish_task,
+                                "mqtt_selftest",
+                                MQTT_SELFTEST_TASK_STACK_SIZE,
+                                NULL,
+                                UART_TASK_PRIORITY,
+                                NULL) != pdPASS) {
+                    ESP_LOGW(TAG, "Failed to create MQTT self-test task");
+                    app_status_note_forward_fail();
+                }
+                break;
+            }
+
+            ESP_LOGI_VERBOSE(TAG, "MQTT->UART forwarding command");
             uart_bridge_queue_command(event->data, event->data_len);
             break;
 
@@ -413,6 +485,106 @@ static bool mqtt_event_matches_topic(esp_mqtt_event_handle_t event, const char *
 
     topic_len = strlen(topic);
     return event->topic_len == (int)topic_len && strncmp(event->topic, topic, topic_len) == 0;
+}
+
+static bool mqtt_event_payload_equals(esp_mqtt_event_handle_t event, const char *payload)
+{
+    size_t payload_len;
+
+    if (event == NULL || payload == NULL || event->data == NULL) {
+        return false;
+    }
+
+    payload_len = strlen(payload);
+    return event->data_len == (int)payload_len && strncmp(event->data, payload, payload_len) == 0;
+}
+
+static bool mqtt_event_json_command_equals(esp_mqtt_event_handle_t event, const char *command)
+{
+    char *payload_copy;
+    bool matched;
+
+    if (event == NULL || command == NULL || event->data == NULL || event->data_len <= 0) {
+        return false;
+    }
+
+    payload_copy = calloc((size_t)event->data_len + 1U, 1U);
+    if (payload_copy == NULL) {
+        ESP_LOGW(TAG, "No memory to parse MQTT command JSON");
+        return false;
+    }
+
+    memcpy(payload_copy, event->data, (size_t)event->data_len);
+    matched = json_string_field_equals(payload_copy, "cmd", command) ||
+              json_string_field_equals(payload_copy, "command", command);
+    free(payload_copy);
+    return matched;
+}
+
+static bool json_string_field_equals(const char *json, const char *field_name, const char *expected)
+{
+    size_t field_len;
+    size_t expected_len;
+    const char *p;
+
+    if (json == NULL || field_name == NULL || expected == NULL) {
+        return false;
+    }
+
+    field_len = strlen(field_name);
+    expected_len = strlen(expected);
+
+    for (p = json; *p != '\0'; p++) {
+        if (*p != '"') {
+            continue;
+        }
+
+        if (strncmp(p + 1, field_name, field_len) != 0 || p[1 + field_len] != '"') {
+            continue;
+        }
+
+        p = skip_json_ws(p + 2 + field_len);
+        if (*p != ':') {
+            continue;
+        }
+
+        p = skip_json_ws(p + 1);
+        if (*p != '"') {
+            continue;
+        }
+        p++;
+
+        if (strncmp(p, expected, expected_len) == 0 && p[expected_len] == '"') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static const char *skip_json_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+
+    return p;
+}
+
+static void publish_selftest_measurement(void)
+{
+    uint32_t rx_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    ESP_LOGI(TAG, "Publishing synthetic MQTT self-test measurement");
+    network_publish_uart_line(SELFTEST_MEASUREMENT_LINE, rx_ms);
+}
+
+static void selftest_publish_task(void *arg)
+{
+    (void)arg;
+
+    publish_selftest_measurement();
+    vTaskDelete(NULL);
 }
 
 /**

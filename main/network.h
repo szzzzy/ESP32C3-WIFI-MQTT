@@ -1,6 +1,9 @@
 #ifndef NETWORK_H
 #define NETWORK_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 /**
  * @brief 初始化网络子系统。
  *
@@ -32,7 +35,19 @@ void network_start_mqtt(void);
  * JSON 结构，最后将结果发布到上行主题。
  *
  * @param line 已经完成一行组包的串口原始文本。
+ * @param rx_ms 该行被接收时的系统毫秒时间戳。
  */
-void network_publish_uart_line(const char *line);
+void network_publish_uart_line(const char *line, uint32_t rx_ms);
+
+/**
+ * @brief 将已构建好的 JSON 字符串直接发布到 MQTT 上行主题。
+ *
+ * 与 network_publish_uart_line() 的区别：本函数跳过协议解析步骤，
+ * 直接接收已构建的 JSON 负载。适用于调用方自行完成解析后选择通道（USB/MQTT）的场景。
+ *
+ * @param json_payload 已构建好的 JSON 字符串（'\0' 结尾）。
+ * @return true 发布成功，false MQTT 未就绪或发送失败。
+ */
+bool network_publish_json_payload(const char *json_payload);
 
 #endif

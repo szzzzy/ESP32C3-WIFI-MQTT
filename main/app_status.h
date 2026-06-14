@@ -92,17 +92,6 @@ void app_status_set_mqtt_connected(bool connected);
 void app_status_set_mqtt_subscribed(bool subscribed);
 
 /* --------------------------------------------------------------------------
- * SD 卡状态更新
- * -------------------------------------------------------------------------- */
-
-/** @brief 记录 SD SPI 总线是否初始化成功 */
-void app_status_set_sd_bus_ready(bool ready);
-/** @brief 记录 SD 卡热插拔监控任务是否已运行 */
-void app_status_set_sd_monitor_running(bool running);
-/** @brief 记录 SD 卡文件系统是否已挂载并可读写 */
-void app_status_set_sd_mounted(bool mounted);
-
-/* --------------------------------------------------------------------------
  * UART 状态更新
  * -------------------------------------------------------------------------- */
 
@@ -119,8 +108,12 @@ void app_status_set_uart_rx_task_running(bool running);
 
 /** @brief 递增 UART 接收到的完整文本行计数 */
 void app_status_note_uart_rx_line(void);
-/** @brief 递增 UART 接收行丢弃计数（单行过长，超过 UART_BUF_SIZE） */
+/** @brief 递增 UART 接收行丢弃计数（单行过长，超过 UART_LINE_BUF_SIZE） */
 void app_status_note_uart_rx_drop(void);
+/** @brief 递增 UART 接收行溢出计数（行缓冲区溢出事件） */
+void app_status_note_uart_rx_overflow(void);
+/** @brief 记录最近一帧 UART 接收完成时的系统毫秒时间戳 */
+void app_status_set_last_frame_ms(uint32_t ms);
 /** @brief 递增 UART 发送队列入队成功计数 */
 void app_status_note_uart_tx_queued(void);
 /**
@@ -142,26 +135,8 @@ void app_status_note_uart_tx_result(bool ok);
 void app_status_note_mqtt_publish(bool ok);
 /** @brief 递增 MQTT 下行命令收到计数（每次收到匹配 topic 的数据帧） */
 void app_status_note_mqtt_command(void);
-
-/* --------------------------------------------------------------------------
- * SD 卡日志计数器
- * -------------------------------------------------------------------------- */
-
-/**
- * @brief 记录一次 SD 日志写入结果。
- *
- * @param ok true 表示 fwrite 成功，false 表示写入、flush、打开文件等 I/O 操作失败。
- */
-void app_status_note_sd_write(bool ok);
-/**
- * @brief 递增 SD 日志丢弃计数。
- *
- * 该接口用于上报"快速路径"中的入队丢弃数量——串口接收侧为了非阻塞，
- * 先用原子计数累计，再由 SD 写入任务批量同步到本模块。
- *
- * @param count 需要累加的丢弃条数。
- */
-void app_status_note_sd_drop(uint32_t count);
+/** @brief 递增转发失败计数（JSON 构建失败或 MQTT 发布失败） */
+void app_status_note_forward_fail(void);
 
 /* --------------------------------------------------------------------------
  * 协议解析计数器

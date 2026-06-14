@@ -3,7 +3,7 @@
 
 #include "esp_err.h"
 
-typedef void (*uart_bridge_line_handler_t)(const char *line, void *ctx);
+typedef void (*uart_bridge_line_handler_t)(const char *line, uint32_t rx_ms, void *ctx);
 
 /**
  * @brief 初始化 UART 驱动和发送队列。
