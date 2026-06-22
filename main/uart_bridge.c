@@ -16,6 +16,7 @@
 
 #include "app_config.h"
 #include "app_status.h"
+#include "line_reader.h"
 #include "uart_bridge.h"
 
 static const char *TAG = APP_TAG;
@@ -44,6 +45,7 @@ static uart_bridge_line_handler_t s_line_handler = NULL;
 static void *s_line_handler_ctx = NULL;
 
 /* ---- 内部任务入口前置声明 ---- */
+static void uart_rx_line_cb(const char *line, void *ctx);
 static void uart_rx_task(void *arg);
 static void uart_tx_task(void *arg);
 
@@ -216,29 +218,52 @@ void uart_bridge_queue_command(const char *payload, int payload_len)
 }
 
 /**
- * @brief UART 接收任务，负责把字节流切分成文本行。
+ * @brief line_reader callback: invoked for each complete UART line.
  *
- * 任务逐字节读取 UART 数据，以换行符作为一帧结束标记。若单行超过缓冲区容量，
- * 会丢弃该行剩余内容直到遇到下一次换行，以防止缓冲区越界。
+ * Records rx_ms, logs the line, updates counters, and forwards to the
+ * upper-layer handler registered via uart_bridge_start_rx_task().
+ */
+static void uart_rx_line_cb(const char *line, void *ctx)
+{
+    uint32_t rx_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    (void)ctx;
+
+    ESP_LOGI_VERBOSE(TAG,
+             "UART RX line (%u bytes) @ %lu ms: %s",
+             (unsigned int)strlen(line),
+             (unsigned long)rx_ms,
+             line);
+    app_status_note_uart_rx_line();
+    app_status_set_last_frame_ms(rx_ms);
+
+    if (s_line_handler != NULL) {
+        s_line_handler(line, rx_ms, s_line_handler_ctx);
+    }
+}
+
+/**
+ * @brief UART 接收任务，逐字节读取并交由 line_reader 切分成文本行。
  *
  * @param arg 任务参数，当前未使用。
  */
 static void uart_rx_task(void *arg)
 {
     uint8_t ch;
-    char *line = malloc(UART_LINE_BUF_SIZE);
-    int idx = 0;
-    bool discarding_line = false;
+    char *line_buf = malloc(UART_LINE_BUF_SIZE);
+    line_reader_t reader;
 
     (void)arg;
 
-    if (line == NULL) {
+    if (line_buf == NULL) {
         ESP_LOGE(TAG, "No memory for UART RX line buffer (%d bytes)", UART_LINE_BUF_SIZE);
         app_status_note_uart_rx_overflow();
         app_status_set_uart_rx_task_running(false);
         vTaskDelete(NULL);
         return;
     }
+
+    line_reader_init(&reader, line_buf, UART_LINE_BUF_SIZE, uart_rx_line_cb, NULL);
 
     while (1) {
         int len = uart_read_bytes(UART_PORT, &ch, 1, pdMS_TO_TICKS(100));
@@ -247,45 +272,11 @@ static void uart_rx_task(void *arg)
             continue;
         }
 
-        if (discarding_line) {
-            if (ch == '\n') {
-                discarding_line = false;
-                idx = 0;
-            }
-            continue;
-        }
-
-        if (ch == '\n') {
-            uint32_t rx_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-
-            line[idx] = '\0';
-
-            if (idx > 0 && line[idx - 1] == '\r') {
-                line[idx - 1] = '\0';
-            }
-
-            ESP_LOGI_VERBOSE(TAG,
-                     "UART RX line (%u bytes) @ %lu ms: %s",
-                     (unsigned int)strlen(line),
-                     (unsigned long)rx_ms,
-                     line);
-            app_status_note_uart_rx_line();
-            app_status_set_last_frame_ms(rx_ms);
-
-            if (s_line_handler != NULL) {
-                s_line_handler(line, rx_ms, s_line_handler_ctx);
-            }
-
-            idx = 0;
-        } else if (idx < UART_LINE_BUF_SIZE - 1) {
-            line[idx++] = (char)ch;
-        } else {
+        if (line_reader_feed(&reader, ch) == LINE_READER_EVENT_OVERFLOW) {
             ESP_LOGW(TAG, "UART RX line too long (%d max), discarding until newline",
                      UART_LINE_BUF_SIZE);
             app_status_note_uart_rx_drop();
             app_status_note_uart_rx_overflow();
-            discarding_line = true;
-            idx = 0;
         }
     }
 }

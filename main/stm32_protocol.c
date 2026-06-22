@@ -8,14 +8,14 @@
  *   对应的 JSON 字符串用于 MQTT 发布。
  *
  * 支持的帧类型：
- *   - M 帧（测量帧）：102 个 CSV 字段，包含血氧/心率/HRV/ECG/PTT/传感器诊断/
- *     系统诊断/崩溃信息/任务栈/心跳等全部遥测数据。
+ *   - M 帧（测量帧）：110 个 CSV 字段，包含血氧/心率/HRV/ECG/PTT/传感器诊断/
+ *     系统诊断/崩溃信息/任务栈/心跳/ECG 质量等全部遥测数据。
  *   - T 帧（时间应答帧）：6 个 CSV 字段，STM32 对时间设置命令的应答。
  *
  * 解析容错策略：
  *   - 每个字段独立解析，单个字段失败（空值、格式错误、类型不匹配）不会丢弃整帧，
  *     而是将对应字段标记为 unavailable 并记录到 parse_warnings 中。
- *   - 超出 102 列的字段存入 extra_fields 数组，不透传丢弃。
+ *   - 超出 110 列的字段存入 extra_fields 数组，不透传丢弃。
  *   - 行过长（超过 LINE_COPY_SIZE）返回 parse_error 而非截断。
  *   - 半包/粘包由上层 UART 模块按 '\n' 成帧处理，本模块只接收完整行。
  *
@@ -28,7 +28,7 @@
  *   - ESP-IDF 模式：包含 app_config.h，使用项目配置的 MQTT 元信息。
  *   - 主机测试模式（定义 STM32_PROTOCOL_HOST_TEST）：使用内联默认值，无需 ESP-IDF。
  *
- * 协议版本：stm32-compact-v2（schema_version=2），对应 STM32 102 列 M 帧。
+ * 协议版本：stm32-compact-v3（schema_version=3），对应 STM32 110 列 M 帧。
  * ===========================================================================
  */
 
@@ -47,7 +47,7 @@
 #define MQTT_BRIDGE_NAME "esp32c3"
 #define MQTT_SOURCE_NAME "stm32"
 #define MQTT_CHANNEL_NAME "uart1"
-#define MQTT_PROTOCOL_NAME "stm32-compact-v2"
+#define MQTT_PROTOCOL_NAME "stm32-compact-v3"
 #define UART_BUF_SIZE 512
 #endif
 
@@ -61,14 +61,14 @@
  * @brief 协议解析常量枚举
  *
  * UART_FIELD_MAX           - 指针数组容量，大于 schema 字段数以容纳超长帧
- * UART_MEASUREMENT_SCHEMA_FIELD_COUNT - M 帧的预定义字段数（列 0-101）
+ * UART_MEASUREMENT_SCHEMA_FIELD_COUNT - M 帧的预定义字段数（列 0-109）
  * UART_T_FIELD_COUNT       - T 帧的固定字段数（T,set_ok,rtc_valid,date,time,reason）
  * PARSE_WARNING_MAX        - 单帧最多记录的解析警告条数
  * PARSE_WARNING_LEN        - 每条警告字符串的最大长度（含 '\0'）
  */
 enum {
-    UART_FIELD_MAX = 128,
-    UART_MEASUREMENT_SCHEMA_FIELD_COUNT = 102,
+    UART_FIELD_MAX = 160,
+    UART_MEASUREMENT_SCHEMA_FIELD_COUNT = 110,
     UART_T_FIELD_COUNT = 6,
     PARSE_WARNING_MAX = 48,
     PARSE_WARNING_LEN = 72,
@@ -225,6 +225,19 @@ typedef struct {
     u32_field_t no_r_peak_timeout_count; /**< 列 84: R波检测超时次数 */
 } ecg_fields_t;
 
+/** @brief ECG 质量模块（列 102-109）：信号质量及 DSP 指标 */
+typedef struct {
+    bool available;
+    u32_field_t signal_quality;          /**< 列 102: ecg_signal_quality 评分(0-100) */
+    u32_field_t invalid_reason;          /**< 列 103: ecg_invalid_reason 无效原因位掩码 */
+    u32_field_t raw_span;                /**< 列 104: ecg_raw_span 原始信号峰峰值 */
+    u32_field_t filtered_span;           /**< 列 105: ecg_filtered_span 滤波后峰峰值 */
+    u32_field_t noise_level;             /**< 列 106: ecg_noise_level 噪声水平 */
+    u32_field_t qrs_threshold;           /**< 列 107: ecg_qrs_threshold QRS检测阈值 */
+    u32_field_t peak_snr_x100;           /**< 列 108: ecg_peak_snr_x100 峰值SNR×100 */
+    u32_field_t dma_available_high_watermark; /**< 列 109: DMA 可用高水位 */
+} ecg_quality_fields_t;
+
 /** @brief PTT 脉搏传导时间模块（列 78-79）：有效标志 + 时间值(ms) */
 typedef struct {
     bool available;
@@ -370,6 +383,7 @@ typedef struct {
     hrv_freq_fields_t hrv_freq;
     motion_fields_t motion;
     ecg_fields_t ecg;
+    ecg_quality_fields_t ecg_quality;
     ptt_fields_t ptt;
     signal_quality_fields_t signal_quality;
     spo2_ratio_fields_t spo2_ratio;

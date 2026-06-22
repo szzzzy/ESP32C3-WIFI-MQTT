@@ -3,12 +3,9 @@
 Publish the current PC time to the STM32 through the existing MQTT bridge.
 
 This script uses MQTT 3.1.1 over plain TCP and only depends on the Python
-standard library. The default payload template assumes the STM32 time-set
-command is:
+standard library. It publishes the STM32 time-set command as:
 
-    SETTIME YYYYMMDD HHMMSS
-
-If the MCU expects a different frame, pass --template to override it.
+    SETTIME YYYY-MM-DD HH:MM:SS
 """
 
 from __future__ import annotations
@@ -26,7 +23,7 @@ from urllib.parse import urlparse
 
 DEFAULT_BROKER_URI = "mqtt://172.20.10.4"
 DEFAULT_TOPIC = "pulseox/cmd"
-DEFAULT_TEMPLATE = "SETTIME {date} {time}"
+COMMAND_NAME = "SETTIME"
 
 DEFINE_RE = re.compile(
     r'#define\s+(MQTT_BROKER_URI|MQTT_COMMAND_TOPIC)\s+"([^"]+)"'
@@ -78,14 +75,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--topic",
         default=firmware_defaults["topic"],
         help="MQTT command topic forwarded by the ESP bridge.",
-    )
-    parser.add_argument(
-        "--template",
-        default=DEFAULT_TEMPLATE,
-        help=(
-            "Payload template. Supported placeholders: "
-            "{date}, {date_dashed}, {time}, {time_colon}, {iso}."
-        ),
     )
     parser.add_argument(
         "--date",
@@ -156,14 +145,8 @@ def build_time_tokens(args: argparse.Namespace) -> Dict[str, str]:
     }
 
 
-def render_payload(template: str, tokens: Dict[str, str]) -> str:
-    try:
-        return template.format(**tokens)
-    except KeyError as exc:
-        raise ValueError(
-            f"unknown template placeholder: {exc.args[0]!r}; "
-            "supported placeholders are {date}, {date_dashed}, {time}, {time_colon}, {iso}"
-        ) from exc
+def build_settime_payload(tokens: Dict[str, str]) -> str:
+    return f"{COMMAND_NAME} {tokens['date_dashed']} {tokens['time_colon']}"
 
 
 def encode_utf8_field(value: str) -> bytes:
@@ -293,7 +276,7 @@ def main(argv: list[str]) -> int:
     try:
         args = parse_args(argv)
         tokens = build_time_tokens(args)
-        payload = render_payload(args.template, tokens)
+        payload = build_settime_payload(tokens)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

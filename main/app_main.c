@@ -12,6 +12,7 @@
 
 #include "app_config.h"
 #include "app_status.h"
+#include "esp_status_report.h"
 #include "network.h"
 #include "stm32_protocol.h"
 #include "uart_bridge.h"
@@ -76,13 +77,14 @@ static void handle_uart_line(const char *line, uint32_t rx_ms, void *ctx)
 void app_main(void)
 {
     ESP_LOGI(TAG,
-             "Bridge config: uart_port=%d tx=%d rx=%d baud=%d mqtt_broker=%s pub_topic=%s cmd_topic=%s",
+             "Bridge config: uart_port=%d tx=%d rx=%d baud=%d mqtt_broker=%s pub_topic=%s status_topic=%s cmd_topic=%s",
              (int)UART_PORT,
              UART_TX_PIN,
              UART_RX_PIN,
              UART_BAUD,
              MQTT_BROKER_URI,
              MQTT_PUBLISH_TOPIC,
+             MQTT_STATUS_TOPIC,
              MQTT_COMMAND_TOPIC);
 
     if (app_status_init() != ESP_OK) {
@@ -119,9 +121,17 @@ void app_main(void)
     }
 
     app_status_log_snapshot("local_io_ready");
+    if (esp_status_report_start_task() != ESP_OK) {
+        ESP_LOGW(TAG, "ESP status report task start failed");
+    } else {
+        esp_status_report_request();
+    }
 
-    network_wait_for_wifi();
+    if (!network_wait_for_wifi(WIFI_WAIT_BEFORE_MQTT_MS)) {
+        ESP_LOGW(TAG, "Starting MQTT before WiFi is fully ready");
+    }
     network_start_mqtt();
 
     app_status_log_snapshot("app_ready");
+    esp_status_report_request();
 }

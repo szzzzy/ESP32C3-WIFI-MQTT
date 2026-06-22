@@ -1,6 +1,6 @@
 enum {
     LINE_COPY_SIZE = 4096,
-    SCHEMA_VERSION = 2,
+    SCHEMA_VERSION = 3,
 };
 
 static bool json_writer_init(json_writer_t *writer);
@@ -11,8 +11,9 @@ static void json_writer_appendf(json_writer_t *writer, const char *fmt, ...);
 static void json_writer_append_escaped(json_writer_t *writer, const char *text);
 static char *json_writer_take(json_writer_t *writer);
 static void json_writer_discard(json_writer_t *writer);
+static int count_csv_fields_const(const char *text);
 static bool field_present(const char **fields, int field_count, int index);
-static int split_csv_fields(char *text, const char **fields, int max_fields);
+static int split_csv_fields(char *text, const char **fields, int field_capacity);
 static bool parse_bool_field(const char **fields, int field_count, int index, const char *name,
                              bool_field_t *out, parse_warnings_t *warnings);
 static bool parse_u32_field(const char **fields, int field_count, int index, const char *name,
@@ -23,13 +24,22 @@ static bool parse_fixed_digits(const char **fields, int field_count, int index, 
                                char *out, size_t out_size, const char *name,
                                bool *available, parse_warnings_t *warnings);
 static void add_warning(parse_warnings_t *warnings, int index, const char *name);
+static void add_field_warning(parse_warnings_t *warnings, int index, const char *name,
+                              const char *reason);
+static void add_warning_text(parse_warnings_t *warnings, const char *text);
+static void add_schema_count_warnings(parse_warnings_t *warnings, int field_count);
 static void append_json_bool_or_null(json_writer_t *writer, const bool_field_t *field);
 static void append_json_u32_or_null(json_writer_t *writer, const u32_field_t *field);
 static void append_json_i32_or_null(json_writer_t *writer, const i32_field_t *field);
 static void append_json_string_or_null(json_writer_t *writer, bool available, const char *value);
 static void append_parse_warnings(json_writer_t *writer, const parse_warnings_t *warnings);
 static void append_extra_fields(json_writer_t *writer, const char **fields, int field_count);
-static char *build_parse_error_json(const char *line, uint32_t rx_ms, const char *error);
+static void append_extra_fields_from(json_writer_t *writer, const char **fields, int field_count,
+                                     int first_extra_index);
+static char *build_parse_error_json(const char *line, uint32_t rx_ms, const char *error,
+                                    const char **fields, int field_count,
+                                    int schema_field_count,
+                                    const parse_warnings_t *warnings);
 static char *build_time_ack_json(const char *line, const char **fields, uint32_t rx_ms);
 static char *build_measurement_json(const char *line, uint32_t rx_ms,
                                     const char **fields, int field_count);
@@ -52,7 +62,7 @@ char *stm32_protocol_build_publish_json(const char *line, uint32_t rx_ms,
     }
 
     if (line[0] == '\0') {
-        json = build_parse_error_json(line, rx_ms, "empty_frame");
+        json = build_parse_error_json(line, rx_ms, "empty_frame", NULL, 0, 0, NULL);
         if (result != NULL) {
             *result = json != NULL ? STM32_PROTOCOL_RESULT_PARSE_ERROR : STM32_PROTOCOL_RESULT_NO_MEMORY;
         }
@@ -61,15 +71,17 @@ char *stm32_protocol_build_publish_json(const char *line, uint32_t rx_ms,
 
     line_len = strlen(line);
     if (line_len >= LINE_COPY_SIZE) {
-        json = build_parse_error_json(line, rx_ms, "line_too_long");
+        json = build_parse_error_json(line, rx_ms, "line_too_long", NULL,
+                                      count_csv_fields_const(line), 0, NULL);
         if (result != NULL) {
             *result = json != NULL ? STM32_PROTOCOL_RESULT_PARSE_ERROR : STM32_PROTOCOL_RESULT_NO_MEMORY;
         }
         return json;
     }
 
+    field_count = count_csv_fields_const(line);
     line_copy = malloc(line_len + 1U);
-    fields = calloc(UART_FIELD_MAX, sizeof(*fields));
+    fields = calloc((size_t)field_count, sizeof(*fields));
     if (line_copy == NULL || fields == NULL) {
         free(line_copy);
         free(fields);
@@ -80,9 +92,9 @@ char *stm32_protocol_build_publish_json(const char *line, uint32_t rx_ms,
     }
 
     memcpy(line_copy, line, line_len + 1U);
-    field_count = split_csv_fields(line_copy, fields, UART_FIELD_MAX);
+    field_count = split_csv_fields(line_copy, fields, field_count);
     if (field_count <= 0 || fields[0][0] == '\0') {
-        json = build_parse_error_json(line, rx_ms, "empty_frame");
+        json = build_parse_error_json(line, rx_ms, "empty_frame", fields, field_count, 0, NULL);
         if (result != NULL) {
             *result = json != NULL ? STM32_PROTOCOL_RESULT_PARSE_ERROR : STM32_PROTOCOL_RESULT_NO_MEMORY;
         }
@@ -103,7 +115,8 @@ char *stm32_protocol_build_publish_json(const char *line, uint32_t rx_ms,
 
     if (strcmp(fields[0], "T") == 0) {
         if (field_count != UART_T_FIELD_COUNT) {
-            json = build_parse_error_json(line, rx_ms, "bad_time_ack_frame");
+            json = build_parse_error_json(line, rx_ms, "bad_time_ack_frame",
+                                          fields, field_count, UART_T_FIELD_COUNT, NULL);
             if (result != NULL) {
                 *result = json != NULL ? STM32_PROTOCOL_RESULT_PARSE_ERROR : STM32_PROTOCOL_RESULT_NO_MEMORY;
             }
@@ -120,7 +133,7 @@ char *stm32_protocol_build_publish_json(const char *line, uint32_t rx_ms,
         return json;
     }
 
-    json = build_parse_error_json(line, rx_ms, "unknown_frame_type");
+    json = build_parse_error_json(line, rx_ms, "unknown_frame_type", fields, field_count, 0, NULL);
     if (result != NULL) {
         *result = json != NULL ? STM32_PROTOCOL_RESULT_PARSE_ERROR : STM32_PROTOCOL_RESULT_NO_MEMORY;
     }
@@ -166,24 +179,33 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     u32_field_t max_task_stack = {0}, ui_task_stack = {0}, sd_task_stack = {0}, wdt_task_stack = {0};
     u32_field_t max_task_heartbeat = {0}, ui_task_heartbeat = {0};
     i32_field_t ecg_filtered = {0};
+    u32_field_t ecg_signal_quality = {0}, ecg_invalid_reason = {0};
+    u32_field_t ecg_raw_span = {0}, ecg_filtered_span = {0}, ecg_noise_level = {0};
+    u32_field_t ecg_qrs_threshold = {0}, ecg_peak_snr_x100 = {0};
+    u32_field_t ecg_dma_available_high_watermark = {0};
     bool date_available = false, time_available = false;
     char date[9] = {0}, time_text[7] = {0};
     bool timestamp_available, raw_ppg_available, hrv_time_available, hrv_freq_available;
     bool signal_quality_available, finger_detect_available, sensor_diag_available;
-    bool system_diag_available, ecg_available, crash_available;
+    bool system_diag_available, ecg_available, ecg_quality_available, crash_available;
     bool task_phase_available, task_stack_available, task_heartbeat_available;
 
     if (!json_writer_init(&w)) {
         return NULL;
     }
 
+    add_schema_count_warnings(&warnings, field_count);
+
+    /* ---- 列 1-3: 时间戳 ---- */
     parse_bool_field(fields, field_count, 1, "rtc_valid", &rtc_valid, &warnings);
     parse_fixed_digits(fields, field_count, 2, 8, date, sizeof(date), "date", &date_available, &warnings);
     parse_fixed_digits(fields, field_count, 3, 6, time_text, sizeof(time_text), "time", &time_available, &warnings);
+    /* ---- 列 4-7: 原始 PPG ---- */
     parse_u32_field(fields, field_count, 4, "red", &red, &warnings);
     parse_u32_field(fields, field_count, 5, "ir", &ir, &warnings);
     parse_u32_field(fields, field_count, 6, "baseline_ir", &baseline_ir, &warnings);
     parse_bool_field(fields, field_count, 7, "finger", &finger, &warnings);
+    /* ---- 列 8-15: 生命体征 (BPM/SpO2/RR/IBI) ---- */
     parse_bool_field(fields, field_count, 8, "bpm_valid", &bpm_valid, &warnings);
     parse_u32_field(fields, field_count, 9, "bpm", &bpm, &warnings);
     parse_bool_field(fields, field_count, 10, "spo2_valid", &spo2_valid, &warnings);
@@ -192,29 +214,36 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     parse_u32_field(fields, field_count, 13, "rr", &rr, &warnings);
     parse_bool_field(fields, field_count, 14, "ibi_valid", &ibi_valid, &warnings);
     parse_u32_field(fields, field_count, 15, "ibi", &ibi, &warnings);
+    /* ---- 列 16-19: HRV 时域 ---- */
     parse_bool_field(fields, field_count, 16, "hrv_valid", &hrv_valid, &warnings);
     parse_u32_field(fields, field_count, 17, "mean_ibi", &mean_ibi, &warnings);
     parse_u32_field(fields, field_count, 18, "sdnn", &sdnn, &warnings);
     parse_u32_field(fields, field_count, 19, "rmssd", &rmssd, &warnings);
+    /* ---- 列 20-21: 运动 ---- */
     parse_bool_field(fields, field_count, 20, "motion_artifact", &motion_artifact, &warnings);
     parse_u32_field(fields, field_count, 21, "motion_score", &motion_score, &warnings);
+    /* ---- 列 22-25: HRV 庞加莱图 ---- */
     parse_u32_field(fields, field_count, 22, "sd1", &sd1, &warnings);
     parse_u32_field(fields, field_count, 23, "sd2", &sd2, &warnings);
     parse_u32_field(fields, field_count, 24, "sd1_sd2_x100", &sd1_sd2, &warnings);
     parse_bool_field(fields, field_count, 25, "rhythm_irregular", &rhythm_irregular, &warnings);
+    /* ---- 列 26-29: HRV 频域 ---- */
     parse_bool_field(fields, field_count, 26, "hrv_freq_valid", &hrv_freq_valid, &warnings);
     parse_u32_field(fields, field_count, 27, "lf_power_x100", &lf_power, &warnings);
     parse_u32_field(fields, field_count, 28, "hf_power_x100", &hf_power, &warnings);
     parse_u32_field(fields, field_count, 29, "lf_hf_x100", &lf_hf, &warnings);
+    /* ---- 列 30-35: 信号质量 ---- */
     parse_u32_field(fields, field_count, 30, "signal_quality", &signal_quality, &warnings);
     parse_bool_field(fields, field_count, 31, "raw_signal_present", &raw_signal_present, &warnings);
     parse_u32_field(fields, field_count, 32, "signal_ir_pi_x1000", &signal_ir_pi, &warnings);
     parse_u32_field(fields, field_count, 33, "signal_red_pi_x1000", &signal_red_pi, &warnings);
     parse_u32_field(fields, field_count, 34, "signal_ir_ac_rms", &signal_ir_ac, &warnings);
     parse_u32_field(fields, field_count, 35, "signal_red_ac_rms", &signal_red_ac, &warnings);
+    /* ---- 列 36-38: SpO2 比率 ---- */
     parse_bool_field(fields, field_count, 36, "spo2_ratio_valid", &spo2_ratio_valid, &warnings);
     parse_u32_field(fields, field_count, 37, "spo2_ratio_x1000", &spo2_ratio, &warnings);
     parse_u32_field(fields, field_count, 38, "spo2_balance_status", &spo2_balance, &warnings);
+    /* ---- 列 39-46: 手指检测诊断 ---- */
     parse_u32_field(fields, field_count, 39, "baseline_range_ir", &baseline_range_ir, &warnings);
     parse_u32_field(fields, field_count, 40, "adaptive_finger_on_delta", &finger_on_delta, &warnings);
     parse_u32_field(fields, field_count, 41, "adaptive_finger_off_delta", &finger_off_delta, &warnings);
@@ -223,6 +252,7 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     parse_u32_field(fields, field_count, 44, "red_signal_span", &red_span, &warnings);
     parse_u32_field(fields, field_count, 45, "finger_on_confirm_count", &finger_on_confirm, &warnings);
     parse_u32_field(fields, field_count, 46, "finger_off_confirm_count", &finger_off_confirm, &warnings);
+    /* ---- 列 47-60: 传感器诊断 (MAX30102) ---- */
     parse_u32_field(fields, field_count, 47, "sensor_last_read_status", &sensor_last_read_status, &warnings);
     parse_u32_field(fields, field_count, 48, "sensor_error_streak", &sensor_error_streak, &warnings);
     parse_u32_field(fields, field_count, 49, "sensor_fifo_write_ptr", &sensor_fifo_write_ptr, &warnings);
@@ -237,6 +267,7 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     parse_u32_field(fields, field_count, 58, "sensor_sample_change_count", &sensor_sample_change, &warnings);
     parse_u32_field(fields, field_count, 59, "sensor_sample_same_count", &sensor_sample_same, &warnings);
     parse_u32_field(fields, field_count, 60, "sensor_last_i2c_error", &sensor_last_i2c_error, &warnings);
+    /* ---- 列 61-71: 系统诊断 ---- */
     parse_bool_field(fields, field_count, 61, "rtc_read_ok", &rtc_read_ok, &warnings);
     parse_bool_field(fields, field_count, 62, "uart_rx_message_valid", &uart_rx_valid, &warnings);
     parse_bool_field(fields, field_count, 63, "uart_tx_message_valid", &uart_tx_valid, &warnings);
@@ -248,6 +279,7 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     parse_u32_field(fields, field_count, 69, "display_last_refresh_tick", &display_last_refresh_tick, &warnings);
     parse_u32_field(fields, field_count, 70, "debug_mode", &debug_mode, &warnings);
     parse_u32_field(fields, field_count, 71, "current_page", &current_page, &warnings);
+    /* ---- 列 72-84: ECG + PTT ---- */
     parse_bool_field(fields, field_count, 72, "ecg_valid", &ecg_valid, &warnings);
     parse_u32_field(fields, field_count, 73, "ecg_hr", &ecg_hr, &warnings);
     parse_u32_field(fields, field_count, 74, "ecg_rr_ms", &ecg_rr_ms, &warnings);
@@ -261,6 +293,7 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     parse_u32_field(fields, field_count, 82, "ecg_dma_overflow_count", &ecg_dma_overflow_count, &warnings);
     parse_u32_field(fields, field_count, 83, "ecg_lead_off_count", &ecg_lead_off_count, &warnings);
     parse_u32_field(fields, field_count, 84, "ecg_no_r_peak_timeout_count", &ecg_no_r_peak_timeout_count, &warnings);
+    /* ---- 列 85-91: 崩溃信息 ---- */
     parse_bool_field(fields, field_count, 85, "crash_flag", &crash_flag, &warnings);
     parse_u32_field(fields, field_count, 86, "crash_source", &crash_source, &warnings);
     parse_u32_field(fields, field_count, 87, "crash_task", &crash_task, &warnings);
@@ -268,16 +301,28 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     parse_u32_field(fields, field_count, 89, "crash_tick", &crash_tick, &warnings);
     parse_u32_field(fields, field_count, 90, "reboot_count", &reboot_count, &warnings);
     parse_u32_field(fields, field_count, 91, "reset_flags", &reset_flags, &warnings);
+    /* ---- 列 92-95: 任务阶段 ---- */
     parse_u32_field(fields, field_count, 92, "max_task_phase", &max_task_phase, &warnings);
     parse_u32_field(fields, field_count, 93, "ui_task_phase", &ui_task_phase, &warnings);
     parse_u32_field(fields, field_count, 94, "sd_task_phase", &sd_task_phase, &warnings);
     parse_u32_field(fields, field_count, 95, "wdt_task_phase", &wdt_task_phase, &warnings);
+    /* ---- 列 96-99: 任务栈高水位 ---- */
     parse_u32_field(fields, field_count, 96, "max_task_stack_hwm", &max_task_stack, &warnings);
     parse_u32_field(fields, field_count, 97, "ui_task_stack_hwm", &ui_task_stack, &warnings);
     parse_u32_field(fields, field_count, 98, "sd_task_stack_hwm", &sd_task_stack, &warnings);
     parse_u32_field(fields, field_count, 99, "wdt_task_stack_hwm", &wdt_task_stack, &warnings);
+    /* ---- 列 100-101: 任务心跳 ---- */
     parse_u32_field(fields, field_count, 100, "max_task_heartbeat", &max_task_heartbeat, &warnings);
     parse_u32_field(fields, field_count, 101, "ui_task_heartbeat", &ui_task_heartbeat, &warnings);
+    /* ---- 列 102-109: ECG 质量 ---- */
+    parse_u32_field(fields, field_count, 102, "ecg_signal_quality", &ecg_signal_quality, &warnings);
+    parse_u32_field(fields, field_count, 103, "ecg_invalid_reason", &ecg_invalid_reason, &warnings);
+    parse_u32_field(fields, field_count, 104, "ecg_raw_span", &ecg_raw_span, &warnings);
+    parse_u32_field(fields, field_count, 105, "ecg_filtered_span", &ecg_filtered_span, &warnings);
+    parse_u32_field(fields, field_count, 106, "ecg_noise_level", &ecg_noise_level, &warnings);
+    parse_u32_field(fields, field_count, 107, "ecg_qrs_threshold", &ecg_qrs_threshold, &warnings);
+    parse_u32_field(fields, field_count, 108, "ecg_peak_snr_x100", &ecg_peak_snr_x100, &warnings);
+    parse_u32_field(fields, field_count, 109, "ecg_dma_available_high_watermark", &ecg_dma_available_high_watermark, &warnings);
 
     timestamp_available = rtc_valid.available || date_available || time_available;
     raw_ppg_available = red.available || ir.available || baseline_ir.available || finger.available;
@@ -315,6 +360,14 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     task_stack_available = max_task_stack.available || ui_task_stack.available ||
                            sd_task_stack.available || wdt_task_stack.available;
     task_heartbeat_available = max_task_heartbeat.available || ui_task_heartbeat.available;
+    ecg_quality_available = ecg_signal_quality.available || ecg_invalid_reason.available ||
+                            ecg_raw_span.available || ecg_filtered_span.available ||
+                            ecg_noise_level.available || ecg_qrs_threshold.available ||
+                            ecg_peak_snr_x100.available || ecg_dma_available_high_watermark.available;
+
+    bool parse_ok = (field_count == UART_MEASUREMENT_SCHEMA_FIELD_COUNT)
+                    && (warnings.count == 0)
+                    && (!warnings.truncated);
 
     json_writer_append(&w, "{\"bridge\":\"");
     json_writer_append_escaped(&w, MQTT_BRIDGE_NAME);
@@ -326,9 +379,10 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     json_writer_append_escaped(&w, MQTT_PROTOCOL_NAME);
     json_writer_appendf(&w,
                         "\",\"schema_version\":%d,\"message\":\"measurement\",\"frame\":\"M\","
-                        "\"rx_ms\":%lu,\"parse_ok\":true,\"raw_line\":\"",
+                        "\"rx_ms\":%lu,\"parse_ok\":%s,\"raw_line\":\"",
                         SCHEMA_VERSION,
-                        (unsigned long)rx_ms);
+                        (unsigned long)rx_ms,
+                        parse_ok ? "true" : "false");
     json_writer_append_escaped(&w, line);
     json_writer_appendf(&w, "\",\"field_count\":%d,\"extra_field_count\":%d,\"parse_warnings\":",
                         field_count,
@@ -386,6 +440,14 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     ADD_U32_FIELD("sensor_read_error_count", sensor_read_error);
     ADD_U32_FIELD("sensor_recover_count", sensor_recover);
     ADD_U32_FIELD("sensor_last_i2c_error", sensor_last_i2c_error);
+    ADD_U32_FIELD("ecg_signal_quality", ecg_signal_quality);
+    ADD_U32_FIELD("ecg_invalid_reason", ecg_invalid_reason);
+    ADD_U32_FIELD("ecg_raw_span", ecg_raw_span);
+    ADD_U32_FIELD("ecg_filtered_span", ecg_filtered_span);
+    ADD_U32_FIELD("ecg_noise_level", ecg_noise_level);
+    ADD_U32_FIELD("ecg_qrs_threshold", ecg_qrs_threshold);
+    ADD_U32_FIELD("ecg_peak_snr_x100", ecg_peak_snr_x100);
+    ADD_U32_FIELD("ecg_dma_available_high_watermark", ecg_dma_available_high_watermark);
 
     json_writer_append(&w, ",\"modules\":{");
     json_writer_appendf(&w, "\"timestamp\":{\"available\":%s},", timestamp_available ? "true" : "false");
@@ -495,6 +557,22 @@ static char *build_measurement_json(const char *line, uint32_t rx_ms,
     append_json_u32_or_null(&w, &max_task_heartbeat);
     json_writer_append(&w, ",\"ui_task_heartbeat\":");
     append_json_u32_or_null(&w, &ui_task_heartbeat);
+    json_writer_appendf(&w, "},\"ecg_quality\":{\"available\":%s,\"signal_quality\":", ecg_quality_available ? "true" : "false");
+    append_json_u32_or_null(&w, &ecg_signal_quality);
+    json_writer_append(&w, ",\"invalid_reason\":");
+    append_json_u32_or_null(&w, &ecg_invalid_reason);
+    json_writer_append(&w, ",\"raw_span\":");
+    append_json_u32_or_null(&w, &ecg_raw_span);
+    json_writer_append(&w, ",\"filtered_span\":");
+    append_json_u32_or_null(&w, &ecg_filtered_span);
+    json_writer_append(&w, ",\"noise_level\":");
+    append_json_u32_or_null(&w, &ecg_noise_level);
+    json_writer_append(&w, ",\"qrs_threshold\":");
+    append_json_u32_or_null(&w, &ecg_qrs_threshold);
+    json_writer_append(&w, ",\"peak_snr_x100\":");
+    append_json_u32_or_null(&w, &ecg_peak_snr_x100);
+    json_writer_append(&w, ",\"dma_available_high_watermark\":");
+    append_json_u32_or_null(&w, &ecg_dma_available_high_watermark);
     json_writer_append(&w, "}}}");
 
 #undef ADD_BOOL_FIELD
@@ -519,7 +597,8 @@ static char *build_time_ack_json(const char *line, const char **fields, uint32_t
     parse_fixed_digits(fields, UART_T_FIELD_COUNT, 4, 6, time_text, sizeof(time_text), "time", &time_available, &warnings);
     if (!set_ok.available || !rtc_valid.available || !date_available || !time_available ||
         !field_present(fields, UART_T_FIELD_COUNT, 5)) {
-        return build_parse_error_json(line, rx_ms, "bad_time_ack_frame");
+        return build_parse_error_json(line, rx_ms, "bad_time_ack_frame",
+                                      fields, UART_T_FIELD_COUNT, UART_T_FIELD_COUNT, &warnings);
     }
 
     if (!json_writer_init(&w)) {
@@ -536,10 +615,16 @@ static char *build_time_ack_json(const char *line, const char **fields, uint32_t
     json_writer_append_escaped(&w, MQTT_PROTOCOL_NAME);
     json_writer_appendf(&w,
                         "\",\"schema_version\":%d,\"message\":\"rtc_set_ack\",\"frame\":\"T\","
-                        "\"rx_ms\":%lu,\"parse_ok\":true,\"set_ok\":%s,\"rtc_valid\":%s,"
-                        "\"date\":\"%s\",\"time\":\"%s\",\"reason\":\"",
+                        "\"rx_ms\":%lu,\"parse_ok\":true,\"raw_line\":\"",
                         SCHEMA_VERSION,
-                        (unsigned long)rx_ms,
+                        (unsigned long)rx_ms);
+    json_writer_append_escaped(&w, line);
+    json_writer_appendf(&w,
+                        "\",\"field_count\":%d,\"extra_field_count\":0,"
+                        "\"parse_warnings\":[],\"extra_fields\":[],"
+                        "\"set_ok\":%s,\"rtc_valid\":%s,"
+                        "\"date\":\"%s\",\"time\":\"%s\",\"reason\":\"",
+                        UART_T_FIELD_COUNT,
                         set_ok.value ? "true" : "false",
                         rtc_valid.value ? "true" : "false",
                         date,
@@ -549,9 +634,27 @@ static char *build_time_ack_json(const char *line, const char **fields, uint32_t
     return json_writer_take(&w);
 }
 
-static char *build_parse_error_json(const char *line, uint32_t rx_ms, const char *error)
+static char *build_parse_error_json(const char *line, uint32_t rx_ms, const char *error,
+                                    const char **fields, int field_count,
+                                    int schema_field_count,
+                                    const parse_warnings_t *warnings)
 {
     json_writer_t w;
+    parse_warnings_t combined_warnings = {0};
+    int extra_field_count = 0;
+
+    add_warning_text(&combined_warnings, error);
+    if (warnings != NULL) {
+        for (size_t i = 0; i < warnings->count; i++) {
+            add_warning_text(&combined_warnings, warnings->items[i]);
+        }
+        if (warnings->truncated) {
+            combined_warnings.truncated = true;
+        }
+    }
+    if (schema_field_count > 0 && field_count > schema_field_count) {
+        extra_field_count = field_count - schema_field_count;
+    }
 
     if (!json_writer_init(&w)) {
         return NULL;
@@ -573,8 +676,37 @@ static char *build_parse_error_json(const char *line, uint32_t rx_ms, const char
     json_writer_append_escaped(&w, error);
     json_writer_append(&w, "\",\"raw_line\":\"");
     json_writer_append_escaped(&w, line != NULL ? line : "");
-    json_writer_append(&w, "\"}");
+    json_writer_appendf(&w,
+                        "\",\"field_count\":%d,\"extra_field_count\":%d,\"parse_warnings\":",
+                        field_count,
+                        extra_field_count);
+    append_parse_warnings(&w, &combined_warnings);
+    json_writer_append(&w, ",\"extra_fields\":");
+    if (fields != NULL && schema_field_count > 0) {
+        append_extra_fields_from(&w, fields, field_count, schema_field_count);
+    } else {
+        json_writer_append(&w, "[]");
+    }
+    json_writer_append(&w, "}");
     return json_writer_take(&w);
+}
+
+static int count_csv_fields_const(const char *text)
+{
+    int count = 0;
+
+    if (text == NULL || text[0] == '\0') {
+        return 0;
+    }
+
+    count = 1;
+    while (*text != '\0') {
+        if (*text == ',') {
+            count++;
+        }
+        text++;
+    }
+    return count;
 }
 
 static bool field_present(const char **fields, int field_count, int index)
@@ -583,17 +715,17 @@ static bool field_present(const char **fields, int field_count, int index)
            fields[index] != NULL && fields[index][0] != '\0';
 }
 
-static int split_csv_fields(char *text, const char **fields, int max_fields)
+static int split_csv_fields(char *text, const char **fields, int field_capacity)
 {
     int count = 0;
     char *cursor = text;
 
-    if (text == NULL || fields == NULL || max_fields <= 0) {
+    if (text == NULL || fields == NULL || field_capacity <= 0) {
         return 0;
     }
 
     fields[count++] = cursor;
-    while (*cursor != '\0' && count < max_fields) {
+    while (*cursor != '\0' && count < field_capacity) {
         if (*cursor == ',') {
             *cursor = '\0';
             fields[count++] = cursor + 1;
@@ -614,6 +746,11 @@ static bool parse_bool_field(const char **fields, int field_count, int index, co
     }
     out->available = false;
     out->value = false;
+    if (fields != NULL && index >= 0 && index < field_count &&
+        fields[index] != NULL && fields[index][0] == '\0') {
+        add_field_warning(warnings, index, name, "empty");
+        return false;
+    }
     if (!field_present(fields, field_count, index)) {
         return false;
     }
@@ -638,6 +775,11 @@ static bool parse_u32_field(const char **fields, int field_count, int index, con
     }
     out->available = false;
     out->value = 0;
+    if (fields != NULL && index >= 0 && index < field_count &&
+        fields[index] != NULL && fields[index][0] == '\0') {
+        add_field_warning(warnings, index, name, "empty");
+        return false;
+    }
     if (!field_present(fields, field_count, index)) {
         return false;
     }
@@ -673,6 +815,11 @@ static bool parse_i32_field(const char **fields, int field_count, int index, con
     }
     out->available = false;
     out->value = 0;
+    if (fields != NULL && index >= 0 && index < field_count &&
+        fields[index] != NULL && fields[index][0] == '\0') {
+        add_field_warning(warnings, index, name, "empty");
+        return false;
+    }
     if (!field_present(fields, field_count, index)) {
         return false;
     }
@@ -711,7 +858,15 @@ static bool parse_fixed_digits(const char **fields, int field_count, int index, 
     if (available != NULL) {
         *available = false;
     }
-    if (out == NULL || out_size < digits + 1U || !field_present(fields, field_count, index)) {
+    if (out == NULL || out_size < digits + 1U) {
+        return false;
+    }
+    if (fields != NULL && index >= 0 && index < field_count &&
+        fields[index] != NULL && fields[index][0] == '\0') {
+        add_field_warning(warnings, index, name, "empty");
+        return false;
+    }
+    if (!field_present(fields, field_count, index)) {
         return false;
     }
     text = fields[index];
@@ -735,6 +890,12 @@ static bool parse_fixed_digits(const char **fields, int field_count, int index, 
 
 static void add_warning(parse_warnings_t *warnings, int index, const char *name)
 {
+    add_field_warning(warnings, index, name, "invalid");
+}
+
+static void add_field_warning(parse_warnings_t *warnings, int index, const char *name,
+                              const char *reason)
+{
     if (warnings == NULL) {
         return;
     }
@@ -744,10 +905,43 @@ static void add_warning(parse_warnings_t *warnings, int index, const char *name)
     }
     snprintf(warnings->items[warnings->count],
              PARSE_WARNING_LEN,
-             "field_%d_%s_invalid",
+             "field_%d_%s_%s",
              index,
-             name != NULL ? name : "value");
+             name != NULL ? name : "value",
+             reason != NULL ? reason : "invalid");
     warnings->count++;
+}
+
+static void add_warning_text(parse_warnings_t *warnings, const char *text)
+{
+    if (warnings == NULL || text == NULL || text[0] == '\0') {
+        return;
+    }
+    if (warnings->count >= PARSE_WARNING_MAX) {
+        warnings->truncated = true;
+        return;
+    }
+    snprintf(warnings->items[warnings->count], PARSE_WARNING_LEN, "%s", text);
+    warnings->count++;
+}
+
+static void add_schema_count_warnings(parse_warnings_t *warnings, int field_count)
+{
+    char text[PARSE_WARNING_LEN];
+
+    if (field_count != UART_MEASUREMENT_SCHEMA_FIELD_COUNT) {
+        snprintf(text,
+                 sizeof(text),
+                 "field_count_%d_expected_%d",
+                 field_count,
+                 UART_MEASUREMENT_SCHEMA_FIELD_COUNT);
+        add_warning_text(warnings, text);
+    }
+
+    if (field_count > UART_FIELD_MAX) {
+        snprintf(text, sizeof(text), "field_count_exceeds_limit_%d", UART_FIELD_MAX);
+        add_warning_text(warnings, text);
+    }
 }
 
 static void append_json_bool_or_null(json_writer_t *writer, const bool_field_t *field)
@@ -787,15 +981,24 @@ static void append_json_string_or_null(json_writer_t *writer, bool available, co
 
 static void append_parse_warnings(json_writer_t *writer, const parse_warnings_t *warnings)
 {
+    bool need_comma = false;
+
     json_writer_append_char(writer, '[');
     if (warnings != NULL) {
         for (size_t i = 0; i < warnings->count; i++) {
-            if (i > 0) {
+            if (need_comma) {
                 json_writer_append_char(writer, ',');
             }
             json_writer_append_char(writer, '"');
             json_writer_append_escaped(writer, warnings->items[i]);
             json_writer_append_char(writer, '"');
+            need_comma = true;
+        }
+        if (warnings->truncated) {
+            if (need_comma) {
+                json_writer_append_char(writer, ',');
+            }
+            json_writer_append(writer, "\"parse_warnings_truncated\"");
         }
     }
     json_writer_append_char(writer, ']');
@@ -803,9 +1006,15 @@ static void append_parse_warnings(json_writer_t *writer, const parse_warnings_t 
 
 static void append_extra_fields(json_writer_t *writer, const char **fields, int field_count)
 {
+    append_extra_fields_from(writer, fields, field_count, UART_MEASUREMENT_SCHEMA_FIELD_COUNT);
+}
+
+static void append_extra_fields_from(json_writer_t *writer, const char **fields, int field_count,
+                                     int first_extra_index)
+{
     json_writer_append_char(writer, '[');
-    for (int i = UART_MEASUREMENT_SCHEMA_FIELD_COUNT; i < field_count; i++) {
-        if (i > UART_MEASUREMENT_SCHEMA_FIELD_COUNT) {
+    for (int i = first_extra_index; i < field_count; i++) {
+        if (i > first_extra_index) {
             json_writer_append_char(writer, ',');
         }
         json_writer_append_char(writer, '"');

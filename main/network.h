@@ -18,7 +18,7 @@ void network_init(void);
  * 该函数会等待到系统成功拿到 IP 地址后才返回，适合在启动 MQTT 之前调用，
  * 以保证后续网络相关组件启动时基础网络已经就绪。
  */
-void network_wait_for_wifi(void);
+bool network_wait_for_wifi(uint32_t timeout_ms);
 
 /**
  * @brief 创建并启动 MQTT 客户端。
@@ -29,25 +29,22 @@ void network_wait_for_wifi(void);
 void network_start_mqtt(void);
 
 /**
- * @brief 把一行串口文本包装成 JSON 并发布到 MQTT。
- *
- * 该接口会先检查 MQTT 是否已连接，再调用协议模块把串口文本转换为统一的
- * JSON 结构，最后将结果发布到上行主题。
- *
- * @param line 已经完成一行组包的串口原始文本。
- * @param rx_ms 该行被接收时的系统毫秒时间戳。
- */
-void network_publish_uart_line(const char *line, uint32_t rx_ms);
-
-/**
  * @brief 将已构建好的 JSON 字符串直接发布到 MQTT 上行主题。
  *
- * 与 network_publish_uart_line() 的区别：本函数跳过协议解析步骤，
- * 直接接收已构建的 JSON 负载。适用于调用方自行完成解析后选择通道（USB/MQTT）的场景。
+ * 调用方需自行完成协议解析和 JSON 构建（通过 stm32_protocol_build_publish_json()），
+ * 然后将结果传入本函数发布。适用于调用方选择上行通道（USB/MQTT）后再发布的场景。
  *
  * @param json_payload 已构建好的 JSON 字符串（'\0' 结尾）。
  * @return true 发布成功，false MQTT 未就绪或发送失败。
  */
 bool network_publish_json_payload(const char *json_payload);
+
+/**
+ * @brief Publish an ESP bridge status JSON payload to MQTT_STATUS_TOPIC.
+ *
+ * Status publishing does not update sensor uplink counters, so GUI heartbeats
+ * do not distort data-path diagnostics.
+ */
+bool network_publish_status_json(const char *json_payload);
 
 #endif

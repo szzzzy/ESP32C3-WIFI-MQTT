@@ -12,11 +12,13 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 
+#include "cJSON.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 
 #include "app_config.h"
 #include "app_status.h"
+#include "esp_status_report.h"
 #include "network.h"
 #include "stm32_protocol.h"
 #include "uart_bridge.h"
@@ -33,6 +35,11 @@ static EventGroupHandle_t s_wifi_event_group = NULL;
 
 /** @brief MQTT 客户端全局句柄，初始为 NULL，由 network_start_mqtt() 创建 */
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
+
+static const char *MQTT_STATUS_OFFLINE_PAYLOAD =
+    "{\"bridge\":\"" MQTT_BRIDGE_NAME "\",\"source\":\"esp32\",\"channel\":\"status\","
+    "\"protocol\":\"esp-status-v1\",\"schema_version\":1,"
+    "\"message\":\"esp_status\",\"online\":false}";
 
 static const char *SELFTEST_MEASUREMENT_LINE =
     "M,1,20260613,120000,"
@@ -58,7 +65,8 @@ static const char *SELFTEST_MEASUREMENT_LINE =
     "0,0,0,0,0,5,1,"
     "3,2,1,0,"
     "512,256,128,64,"
-    "999,500";
+    "999,500,"
+    "80,0,1024,512,120,900,450,768";
 
 /* ---- 内部前置声明 ---- */
 static void init_nvs_flash(void);
@@ -72,14 +80,16 @@ static void mqtt_event_handler(void *handler_args,
                                int32_t event_id,
                                void *event_data);
 static void log_mqtt_error_details(esp_mqtt_event_handle_t event);
+static bool mqtt_publish_json_to_topic(const char *topic,
+                                       const char *json_payload,
+                                       int qos,
+                                       int retain,
+                                       bool update_data_stats);
 static bool mqtt_event_matches_topic(esp_mqtt_event_handle_t event, const char *topic);
 static bool mqtt_event_payload_equals(esp_mqtt_event_handle_t event, const char *payload);
 static bool mqtt_event_json_command_equals(esp_mqtt_event_handle_t event, const char *command);
-static bool json_string_field_equals(const char *json, const char *field_name, const char *expected);
-static const char *skip_json_ws(const char *p);
 static void publish_selftest_measurement(void);
 static void selftest_publish_task(void *arg);
-static const char *protocol_result_to_string(stm32_protocol_result_t result);
 
 /**
  * @brief 初始化网络模块的基础能力。
@@ -99,14 +109,25 @@ void network_init(void)
  * 该函数通过事件组阻塞等待连接位被置位，适合作为 MQTT 启动前的同步点，
  * 避免 broker 连接在底层网络尚未就绪时立即失败。
  */
-void network_wait_for_wifi(void)
+bool network_wait_for_wifi(uint32_t timeout_ms)
 {
+    EventBits_t bits;
+    TickType_t wait_ticks = (timeout_ms == 0U) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+
     ESP_LOGI(TAG, "Waiting for WiFi...");
-    xEventGroupWaitBits(s_wifi_event_group,
-                        APP_WIFI_CONNECTED_BIT,
-                        pdFALSE,
-                        pdTRUE,
-                        portMAX_DELAY);
+    bits = xEventGroupWaitBits(s_wifi_event_group,
+                               APP_WIFI_CONNECTED_BIT,
+                               pdFALSE,
+                               pdTRUE,
+                               wait_ticks);
+    if ((bits & APP_WIFI_CONNECTED_BIT) == 0) {
+        ESP_LOGW(TAG,
+                 "WiFi did not get IP within %lu ms; MQTT will start and auto-reconnect",
+                 (unsigned long)timeout_ms);
+        return false;
+    }
+
+    return true;
 }
 
 /**
@@ -119,6 +140,16 @@ void network_start_mqtt(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
+        .session.last_will.topic = MQTT_STATUS_TOPIC,
+        .session.last_will.msg = MQTT_STATUS_OFFLINE_PAYLOAD,
+        .session.last_will.qos = MQTT_LWT_QOS,
+        .session.last_will.retain = MQTT_LWT_RETAIN,
+        .session.keepalive = MQTT_KEEPALIVE_SECONDS,
+        .session.message_retransmit_timeout = MQTT_RETRANSMIT_TIMEOUT_MS,
+        .network.timeout_ms = MQTT_NETWORK_TIMEOUT_MS,
+        .network.reconnect_timeout_ms = MQTT_RECONNECT_TIMEOUT_MS,
+        .buffer.size = MQTT_BUFFER_SIZE_BYTES,
+        .buffer.out_size = MQTT_BUFFER_SIZE_BYTES,
     };
 
     if (s_mqtt_client != NULL) {
@@ -126,9 +157,10 @@ void network_start_mqtt(void)
     }
 
     ESP_LOGI(TAG,
-             "Starting MQTT client, broker=%s, pub_topic=%s, cmd_topic=%s",
+             "Starting MQTT client, broker=%s, pub_topic=%s, status_topic=%s, cmd_topic=%s",
              MQTT_BROKER_URI,
              MQTT_PUBLISH_TOPIC,
+             MQTT_STATUS_TOPIC,
              MQTT_COMMAND_TOPIC);
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -137,6 +169,7 @@ void network_start_mqtt(void)
         abort();
     }
     app_status_set_mqtt_started(true);
+    esp_status_report_request();
 
     ESP_ERROR_CHECK(esp_mqtt_client_register_event(
         s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
@@ -154,69 +187,16 @@ void network_start_mqtt(void)
  */
 bool network_publish_json_payload(const char *json_payload)
 {
-    EventBits_t bits;
-    int msg_id;
-
-    if (json_payload == NULL || json_payload[0] == '\0') {
-        return false;
-    }
-
-    if (s_mqtt_client == NULL) {
-        ESP_LOGW(TAG, "MQTT client not created yet");
-        app_status_note_mqtt_publish(false);
-        app_status_note_forward_fail();
-        return false;
-    }
-
-    bits = xEventGroupGetBits(s_wifi_event_group);
-    if ((bits & APP_MQTT_CONNECTED_BIT) == 0) {
-        ESP_LOGW(TAG, "MQTT not ready, drop JSON payload");
-        app_status_note_mqtt_publish(false);
-        app_status_note_forward_fail();
-        return false;
-    }
-
-    msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_PUBLISH_TOPIC, json_payload, 0, 1, 0);
-    if (msg_id >= 0) {
-        ESP_LOGI_VERBOSE(TAG, "Published to MQTT topic=%s, msg_id=%d", MQTT_PUBLISH_TOPIC, msg_id);
-        app_status_note_mqtt_publish(true);
-        return true;
-    }
-
-    ESP_LOGW(TAG, "Failed to publish JSON payload to topic=%s", MQTT_PUBLISH_TOPIC);
-    app_status_note_mqtt_publish(false);
-    app_status_note_forward_fail();
-    return false;
+    return mqtt_publish_json_to_topic(MQTT_PUBLISH_TOPIC, json_payload, MQTT_DATA_QOS, 0, true);
 }
 
-void network_publish_uart_line(const char *line, uint32_t rx_ms)
+bool network_publish_status_json(const char *json_payload)
 {
-    char *json_payload;
-    stm32_protocol_result_t protocol_result = STM32_PROTOCOL_RESULT_NONE;
-
-    if (line == NULL || line[0] == '\0') {
-        return;
-    }
-
-    ESP_LOGI_VERBOSE(TAG, "UART->MQTT raw line (%u bytes) @ %lu ms: %s",
-             (unsigned int)strlen(line), (unsigned long)rx_ms, line);
-
-    json_payload = stm32_protocol_build_publish_json(line, rx_ms, &protocol_result);
-    app_status_note_protocol_result(protocol_result);
-    if (json_payload == NULL) {
-        ESP_LOGW(TAG, "Failed to build JSON payload for UART line");
-        app_status_note_mqtt_publish(false);
-        app_status_note_forward_fail();
-        return;
-    }
-
-    ESP_LOGI_VERBOSE(TAG,
-             "UART->MQTT parsed result=%s payload_len=%u",
-             protocol_result_to_string(protocol_result),
-             (unsigned int)strlen(json_payload));
-
-    (void)network_publish_json_payload(json_payload);
-    free(json_payload);
+    return mqtt_publish_json_to_topic(MQTT_STATUS_TOPIC,
+                                      json_payload,
+                                      MQTT_STATUS_QOS,
+                                      MQTT_STATUS_RETAIN,
+                                      false);
 }
 
 /**
@@ -293,21 +273,29 @@ static void wifi_event_handler(void *arg,
                                void *event_data)
 {
     (void)arg;
-    (void)event_data;
-
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
         ESP_LOGI(TAG, "WiFi start, connecting...");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi disconnected, retrying...");
+        wifi_event_sta_disconnected_t *disconnected = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG,
+                 "WiFi disconnected, reason=%d, retrying...",
+                 disconnected != NULL ? disconnected->reason : -1);
         xEventGroupClearBits(s_wifi_event_group, APP_WIFI_CONNECTED_BIT | APP_MQTT_CONNECTED_BIT);
         app_status_set_wifi_connected(false);
         app_status_set_mqtt_connected(false);
+        esp_status_report_request();
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ESP_LOGI(TAG, "WiFi connected, got IP");
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        if (event != NULL) {
+            ESP_LOGI(TAG, "WiFi connected, got IP " IPSTR, IP2STR(&event->ip_info.ip));
+        } else {
+            ESP_LOGI(TAG, "WiFi connected, got IP");
+        }
         xEventGroupSetBits(s_wifi_event_group, APP_WIFI_CONNECTED_BIT);
         app_status_set_wifi_connected(true);
+        esp_status_report_request();
     }
 }
 
@@ -338,8 +326,9 @@ static void mqtt_event_handler(void *handler_args,
             ESP_LOGI(TAG, "MQTT connected");
             xEventGroupSetBits(s_wifi_event_group, APP_MQTT_CONNECTED_BIT);
             app_status_set_mqtt_connected(true);
+            esp_status_report_request();
 
-            msg_id = esp_mqtt_client_subscribe(s_mqtt_client, MQTT_COMMAND_TOPIC, 1);
+            msg_id = esp_mqtt_client_subscribe(s_mqtt_client, MQTT_COMMAND_TOPIC, MQTT_COMMAND_QOS);
             if (msg_id >= 0) {
                 ESP_LOGI(TAG, "Subscribed to command topic, msg_id=%d", msg_id);
             } else {
@@ -351,6 +340,7 @@ static void mqtt_event_handler(void *handler_args,
             ESP_LOGW(TAG, "MQTT disconnected");
             xEventGroupClearBits(s_wifi_event_group, APP_MQTT_CONNECTED_BIT);
             app_status_set_mqtt_connected(false);
+            esp_status_report_request();
             break;
 
         case MQTT_EVENT_ERROR:
@@ -361,6 +351,7 @@ static void mqtt_event_handler(void *handler_args,
         case MQTT_EVENT_SUBSCRIBED:
             ESP_LOGI(TAG, "MQTT subscription acknowledged, msg_id=%d", event->msg_id);
             app_status_set_mqtt_subscribed(true);
+            esp_status_report_request();
             esp_log_level_set("wifi", ESP_LOG_WARN);
             esp_log_level_set("mqtt_client", ESP_LOG_WARN);
             esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
@@ -395,6 +386,12 @@ static void mqtt_event_handler(void *handler_args,
             }
 
             app_status_note_mqtt_command();
+            ESP_LOGI(TAG,
+                     "MQTT command received (len=%d qos=%d retain=%d dup=%d)",
+                     event->data_len,
+                     event->qos,
+                     event->retain,
+                     event->dup);
 
             if (mqtt_event_payload_equals(event, MQTT_SELFTEST_COMMAND) ||
                 mqtt_event_json_command_equals(event, MQTT_SELFTEST_COMMAND)) {
@@ -475,6 +472,55 @@ static void log_mqtt_error_details(esp_mqtt_event_handle_t event)
  *
  * @return true 表示主题完全匹配，false 表示不匹配或输入非法。
  */
+static bool mqtt_publish_json_to_topic(const char *topic,
+                                       const char *json_payload,
+                                       int qos,
+                                       int retain,
+                                       bool update_data_stats)
+{
+    EventBits_t bits;
+    int msg_id;
+
+    if (topic == NULL || topic[0] == '\0' || json_payload == NULL || json_payload[0] == '\0') {
+        return false;
+    }
+
+    if (s_mqtt_client == NULL || s_wifi_event_group == NULL) {
+        if (update_data_stats) {
+            ESP_LOGW(TAG, "MQTT client not created yet");
+            app_status_note_mqtt_publish(false);
+            app_status_note_forward_fail();
+        }
+        return false;
+    }
+
+    bits = xEventGroupGetBits(s_wifi_event_group);
+    if ((bits & APP_MQTT_CONNECTED_BIT) == 0) {
+        if (update_data_stats) {
+            ESP_LOGW(TAG, "MQTT not ready, drop JSON payload");
+            app_status_note_mqtt_publish(false);
+            app_status_note_forward_fail();
+        }
+        return false;
+    }
+
+    msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, json_payload, 0, qos, retain);
+    if (msg_id >= 0) {
+        ESP_LOGI_VERBOSE(TAG, "Published to MQTT topic=%s, msg_id=%d", topic, msg_id);
+        if (update_data_stats) {
+            app_status_note_mqtt_publish(true);
+        }
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Failed to publish JSON payload to topic=%s", topic);
+    if (update_data_stats) {
+        app_status_note_mqtt_publish(false);
+        app_status_note_forward_fail();
+    }
+    return false;
+}
+
 static bool mqtt_event_matches_topic(esp_mqtt_event_handle_t event, const char *topic)
 {
     size_t topic_len;
@@ -501,8 +547,10 @@ static bool mqtt_event_payload_equals(esp_mqtt_event_handle_t event, const char 
 
 static bool mqtt_event_json_command_equals(esp_mqtt_event_handle_t event, const char *command)
 {
+    cJSON *root;
+    cJSON *cmd_field;
     char *payload_copy;
-    bool matched;
+    bool matched = false;
 
     if (event == NULL || command == NULL || event->data == NULL || event->data_len <= 0) {
         return false;
@@ -515,68 +563,44 @@ static bool mqtt_event_json_command_equals(esp_mqtt_event_handle_t event, const 
     }
 
     memcpy(payload_copy, event->data, (size_t)event->data_len);
-    matched = json_string_field_equals(payload_copy, "cmd", command) ||
-              json_string_field_equals(payload_copy, "command", command);
+
+    root = cJSON_Parse(payload_copy);
+    if (root == NULL) {
+        free(payload_copy);
+        return false;
+    }
+
+    cmd_field = cJSON_GetObjectItem(root, "cmd");
+    if (cmd_field == NULL) {
+        cmd_field = cJSON_GetObjectItem(root, "command");
+    }
+
+    if (cmd_field != NULL && cJSON_IsString(cmd_field)) {
+        matched = strcmp(cmd_field->valuestring, command) == 0;
+    }
+
+    cJSON_Delete(root);
     free(payload_copy);
     return matched;
 }
 
-static bool json_string_field_equals(const char *json, const char *field_name, const char *expected)
-{
-    size_t field_len;
-    size_t expected_len;
-    const char *p;
-
-    if (json == NULL || field_name == NULL || expected == NULL) {
-        return false;
-    }
-
-    field_len = strlen(field_name);
-    expected_len = strlen(expected);
-
-    for (p = json; *p != '\0'; p++) {
-        if (*p != '"') {
-            continue;
-        }
-
-        if (strncmp(p + 1, field_name, field_len) != 0 || p[1 + field_len] != '"') {
-            continue;
-        }
-
-        p = skip_json_ws(p + 2 + field_len);
-        if (*p != ':') {
-            continue;
-        }
-
-        p = skip_json_ws(p + 1);
-        if (*p != '"') {
-            continue;
-        }
-        p++;
-
-        if (strncmp(p, expected, expected_len) == 0 && p[expected_len] == '"') {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static const char *skip_json_ws(const char *p)
-{
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
-        p++;
-    }
-
-    return p;
-}
-
 static void publish_selftest_measurement(void)
 {
+    stm32_protocol_result_t protocol_result = STM32_PROTOCOL_RESULT_NONE;
     uint32_t rx_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    char *json_payload;
 
     ESP_LOGI(TAG, "Publishing synthetic MQTT self-test measurement");
-    network_publish_uart_line(SELFTEST_MEASUREMENT_LINE, rx_ms);
+    json_payload = stm32_protocol_build_publish_json(SELFTEST_MEASUREMENT_LINE, rx_ms, &protocol_result);
+    app_status_note_protocol_result(protocol_result);
+    if (json_payload != NULL) {
+        (void)network_publish_json_payload(json_payload);
+        free(json_payload);
+    } else {
+        ESP_LOGW(TAG, "Failed to build JSON payload for self-test");
+        app_status_note_mqtt_publish(false);
+        app_status_note_forward_fail();
+    }
 }
 
 static void selftest_publish_task(void *arg)
@@ -585,30 +609,4 @@ static void selftest_publish_task(void *arg)
 
     publish_selftest_measurement();
     vTaskDelete(NULL);
-}
-
-/**
- * @brief 将 STM32 协议解析结果枚举转为可读的字符串标签。
- *
- * 用于 MQTT 上行发布时的日志输出，方便在串口日志中快速区分消息类型。
- */
-static const char *protocol_result_to_string(stm32_protocol_result_t result)
-{
-    switch (result) {
-        case STM32_PROTOCOL_RESULT_MEASUREMENT:
-            return "measurement";
-
-        case STM32_PROTOCOL_RESULT_TIME_ACK:
-            return "time_ack";
-
-        case STM32_PROTOCOL_RESULT_PARSE_ERROR:
-            return "parse_error";
-
-        case STM32_PROTOCOL_RESULT_NO_MEMORY:
-            return "no_memory";
-
-        case STM32_PROTOCOL_RESULT_NONE:
-        default:
-            return "none";
-    }
 }

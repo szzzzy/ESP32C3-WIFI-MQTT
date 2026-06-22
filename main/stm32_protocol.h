@@ -11,7 +11,7 @@
  */
 typedef enum {
     STM32_PROTOCOL_RESULT_NONE = 0,        /**< 未解析或无效输入 */
-    STM32_PROTOCOL_RESULT_MEASUREMENT,     /**< 成功解析测量帧（M 帧），最多 102 个字段 */
+    STM32_PROTOCOL_RESULT_MEASUREMENT,     /**< 成功解析测量帧（M 帧），最多 110 个字段 */
     STM32_PROTOCOL_RESULT_TIME_ACK,        /**< 成功解析时间应答帧（T 帧），6 个字段 */
     STM32_PROTOCOL_RESULT_PARSE_ERROR,     /**< 解析失败：格式错误、字段非法或未知帧类型 */
     STM32_PROTOCOL_RESULT_NO_MEMORY,       /**< 内存分配失败（malloc/realloc 返回 NULL） */
@@ -23,7 +23,7 @@ typedef enum {
  * 这是协议模块的主入口函数。它接收从串口收到的完整文本行（已去除 \\r\\n），
  * 根据首字段判断帧类型并走不同的解析路径：
  *
- * - M 帧（测量帧）：逐字段解析 102 个预定义位置，各字段独立报错、独立 available/valid 标记，
+ * - M 帧（测量帧）：逐字段解析 110 个预定义位置，各字段独立报错、独立 available/valid 标记，
  *   最后构建包含所有模块数据的完整 JSON。某个字段缺失或格式错误不会导致整帧失败，
  *   而是记录在 parse_warnings 中。
  *

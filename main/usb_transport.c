@@ -14,6 +14,8 @@
 #include "esp_timer.h"
 
 #include "app_config.h"
+#include "esp_status_report.h"
+#include "line_reader.h"
 #include "uart_bridge.h"
 #include "usb_transport.h"
 
@@ -45,6 +47,7 @@ static int64_t s_last_activity_us = 0;
 static portMUX_TYPE s_session_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* ---- 内部函数声明 ---- */
+static void usb_rx_line_cb(const char *line, void *ctx);
 static void usb_tx_task(void *arg);
 static void usb_rx_task(void *arg);
 static bool usb_write_all(const char *data, size_t len);
@@ -156,6 +159,7 @@ bool usb_transport_is_active(void)
     if (timed_out) {
         ESP_LOGI(TAG, "USB session timed out (%d ms), switching to MQTT",
                  USB_SESSION_TIMEOUT_MS);
+        esp_status_report_request();
     }
 #else
     (void)active;
@@ -175,6 +179,7 @@ void usb_transport_deactivate(void)
     portEXIT_CRITICAL(&s_session_lock);
     if (was_active) {
         ESP_LOGI(TAG, "USB session deactivated, uplink now MQTT");
+        esp_status_report_request();
     }
 #endif
 }
@@ -222,7 +227,7 @@ bool usb_transport_queue_json(const char *json_payload)
         return false;
     }
 
-    ESP_LOGI_VERBOSE(TAG, "UART->USB queued JSON (%u bytes)", (unsigned int)msg.len);
+    ESP_LOGI_VERBOSE(TAG, "USB queued JSON (%u bytes)", (unsigned int)msg.len);
     return true;
 #else
     (void)json_payload;
@@ -252,6 +257,7 @@ static void usb_session_activate(void)
     portEXIT_CRITICAL(&s_session_lock);
     if (just_activated) {
         ESP_LOGI(TAG, "USB session ACTIVATED by GUI, uplink switching to USB");
+        esp_status_report_request();
     }
 }
 
@@ -339,23 +345,47 @@ static void usb_tx_task(void *arg)
 }
 
 /**
+ * @brief line_reader callback: process a complete USB line.
+ *
+ * Handles USB session control commands (START/STOP/PING) locally;
+ * forwards all other commands to uart_bridge_queue_command().
+ */
+static void usb_rx_line_cb(const char *line, void *ctx)
+{
+    (void)ctx;
+
+    if (line[0] == '\0') {
+        return;
+    }
+
+    if (strcmp(line, GUI_USB_START) == 0) {
+        usb_session_activate();
+    } else if (strcmp(line, GUI_USB_STOP) == 0) {
+        usb_transport_deactivate();
+    } else if (strcmp(line, GUI_USB_PING) == 0) {
+        usb_session_renew();
+    } else {
+        ESP_LOGI(TAG, "USB->UART command (%u bytes): %s",
+                 (unsigned int)strlen(line), line);
+        uart_bridge_queue_command(line, (int)strlen(line));
+    }
+}
+
+/**
  * @brief USB 接收任务。
  *
- * 持续读取 USB Serial/JTAG 字节流，按换行切分命令。
- * 三条控制命令特殊处理：
- *   - GUI_USB_START: 激活/续期 USB 会话
- *   - GUI_USB_STOP:  停用 USB 会话，切回 MQTT
- *   - GUI_USB_PING:  仅续期，保持会话活跃
- * 其他所有命令透传到 uart_bridge_queue_command() 转发给 STM32。
+ * 持续读取 USB Serial/JTAG 字节流，由 line_reader 按换行切分为完整命令，
+ * 经 usb_rx_line_cb 分发到会话控制或 UART 转发。
  */
 static void usb_rx_task(void *arg)
 {
     uint8_t buf[64];
-    char line[USB_TRANSPORT_LINE_BUF_SIZE];
-    int idx = 0;
-    bool discarding_line = false;
+    char line_buf[USB_TRANSPORT_LINE_BUF_SIZE];
+    line_reader_t reader;
 
     (void)arg;
+
+    line_reader_init(&reader, line_buf, USB_TRANSPORT_LINE_BUF_SIZE, usb_rx_line_cb, NULL);
 
     while (1) {
         int len = usb_serial_jtag_read_bytes(buf, sizeof(buf), pdMS_TO_TICKS(100));
@@ -365,48 +395,10 @@ static void usb_rx_task(void *arg)
         }
 
         for (int i = 0; i < len; i++) {
-            uint8_t ch = buf[i];
-
-            if (discarding_line) {
-                if (ch == '\n') {
-                    discarding_line = false;
-                    idx = 0;
-                }
-                continue;
-            }
-
-            if (ch == '\n') {
-                line[idx] = '\0';
-
-                if (idx > 0 && line[idx - 1] == '\r') {
-                    line[idx - 1] = '\0';
-                }
-
-                if (line[0] != '\0') {
-                    /* ---- USB 会话控制命令 ---- */
-                    if (strcmp(line, GUI_USB_START) == 0) {
-                        usb_session_activate();
-                    } else if (strcmp(line, GUI_USB_STOP) == 0) {
-                        usb_transport_deactivate();
-                    } else if (strcmp(line, GUI_USB_PING) == 0) {
-                        usb_session_renew();
-                    } else {
-                        /* 其他命令透传给 STM32 */
-                        ESP_LOGI(TAG, "USB->UART command (%u bytes): %s",
-                                 (unsigned int)strlen(line), line);
-                        uart_bridge_queue_command(line, (int)strlen(line));
-                    }
-                }
-
-                idx = 0;
-            } else if (idx < USB_TRANSPORT_LINE_BUF_SIZE - 1) {
-                line[idx++] = (char)ch;
-            } else {
+            if (line_reader_feed(&reader, buf[i]) == LINE_READER_EVENT_OVERFLOW) {
                 ESP_LOGW(TAG,
                          "USB RX line too long (%d max), discarding until newline",
                          USB_TRANSPORT_LINE_BUF_SIZE);
-                discarding_line = true;
-                idx = 0;
             }
         }
     }

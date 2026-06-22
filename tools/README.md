@@ -5,7 +5,7 @@
 `verify_bridge_flow.py` provides repeatable checks for the current bridge
 firmware:
 
-- Generate a valid 102-field STM32 measurement frame.
+- Generate a valid 110-field STM32 measurement frame.
 - Trigger the ESP32 MQTT self-test without STM32 or rewiring.
 - Observe the live STM32 -> ESP32 -> MQTT uplink without rewiring.
 - Verify USB loopback: USB command -> UART TX/RX loopback -> parser -> USB JSON.
@@ -61,24 +61,18 @@ Send the current PC time using the firmware defaults discovered from
 python .\tools\publish_pc_time.py
 ```
 
-## Default frame assumption
+## Time command
 
-The default payload template is:
-
-```text
-SETTIME {date} {time}
-```
-
-That becomes:
+The payload is always:
 
 ```text
-SETTIME 20260407 153045
+SETTIME YYYY-MM-DD HH:MM:SS
 ```
 
-If the STM32 expects a different set-time frame, override it with `--template`:
+For example:
 
-```powershell
-python .\tools\publish_pc_time.py --template "TIME {date_dashed} {time_colon}"
+```text
+SETTIME 2026-04-07 15:30:45
 ```
 
 ## Useful options

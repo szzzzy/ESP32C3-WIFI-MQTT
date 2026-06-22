@@ -8,6 +8,38 @@
 
 #include "stm32_protocol.h"
 
+typedef struct {
+    bool wifi_started;
+    bool wifi_connected;
+
+    bool mqtt_started;
+    bool mqtt_connected;
+    bool mqtt_subscribed;
+
+    bool uart_ready;
+    bool uart_tx_task_running;
+    bool uart_rx_task_running;
+
+    bool last_protocol_ok;
+    char last_frame_type;
+    uint32_t last_frame_ms;
+
+    uint32_t uart_rx_lines;
+    uint32_t uart_rx_drops;
+    uint32_t uart_rx_overflows;
+    uint32_t uart_tx_queued;
+    uint32_t uart_tx_ok;
+    uint32_t uart_tx_fail;
+
+    uint32_t mqtt_publish_ok;
+    uint32_t mqtt_publish_fail;
+    uint32_t mqtt_command_count;
+
+    uint32_t protocol_ok;
+    uint32_t protocol_error;
+    uint32_t forward_fail;
+} app_status_public_snapshot_t;
+
 /* ==========================================================================
  * 模块: 运行状态监控
  *
@@ -19,7 +51,8 @@
  *   3. 发生协议错误、MQTT 断连等关键事件时立即触发状态快照输出
  *
  * 线程安全:
- *   所有 set_/note_ 接口内部使用互斥锁保护共享状态，可在中断/任务/回调中安全调用。
+ *   所有 set_/note_ 接口内部使用互斥锁保护共享状态，可在任务/回调中安全调用。
+ *   注意：这些接口使用阻塞互斥锁（portMAX_DELAY），不能在 ISR 中调用。
  *   copy_snapshot 使用"持锁复制"模式，读出的快照是瞬时一致的副本。
  *
  * 依赖:
@@ -65,6 +98,15 @@ esp_err_t app_status_start_task(void);
  *               为 NULL 或空字符串时默认显示 "snapshot"。
  */
 void app_status_log_snapshot(const char *reason);
+
+/**
+ * @brief Copy the current runtime status into caller-owned storage.
+ *
+ * The returned snapshot is a moment-in-time copy protected by the internal
+ * mutex. If the module is not initialized or snapshot is NULL, the function
+ * returns without writing.
+ */
+void app_status_read_snapshot(app_status_public_snapshot_t *snapshot);
 
 /* --------------------------------------------------------------------------
  * WiFi 状态更新

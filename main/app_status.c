@@ -9,6 +9,7 @@
 
 #include "app_config.h"
 #include "app_status.h"
+#include "status_strings.h"
 
 static const char *TAG = APP_TAG;
 
@@ -85,12 +86,6 @@ static void app_status_task(void *arg);
  */
 static void app_status_copy_snapshot(app_status_snapshot_t *snapshot);
 
-/* ---- 以下四个函数将布尔状态字段映射为可读的短字符串，用于日志输出 ---- */
-static const char *wifi_state_string(const app_status_snapshot_t *snapshot);
-static const char *mqtt_state_string(const app_status_snapshot_t *snapshot);
-static const char *uart_state_string(const app_status_snapshot_t *snapshot);
-static const char *protocol_state_string(const app_status_snapshot_t *snapshot);
-
 /**
  * @brief 线程安全地设置布尔字段，并在发生变更时自动触发快照日志。
  *
@@ -150,10 +145,10 @@ void app_status_log_snapshot(const char *reason)
     ESP_LOGI(TAG,
              "STATUS[%s] wifi=%s mqtt=%s uart=%s protocol=%s(last=%c)",
              label,
-             wifi_state_string(&snapshot),
-             mqtt_state_string(&snapshot),
-             uart_state_string(&snapshot),
-             protocol_state_string(&snapshot),
+             WIFI_STATE_STR(&snapshot),
+             MQTT_STATE_STR(&snapshot),
+             UART_STATE_STR(&snapshot),
+             PROTOCOL_STATE_STR(&snapshot),
              snapshot.last_frame_type);
     ESP_LOGI(TAG,
              "STATUS[%s] uart_rx=%lu uart_drop=%lu uart_overflow=%lu uart_tx_queued=%lu uart_tx_ok=%lu uart_tx_fail=%lu",
@@ -439,71 +434,41 @@ static void app_status_copy_snapshot(app_status_snapshot_t *snapshot)
     }
 }
 
-/**
- * @brief 将 WiFi 布尔状态转为单行可读字符串。
- *
- * 优先级: wifi_connected → "ok"; wifi_started → "connecting"; 否则 → "stopped"
- */
-static const char *wifi_state_string(const app_status_snapshot_t *snapshot)
+void app_status_read_snapshot(app_status_public_snapshot_t *snapshot)
 {
-    if (snapshot->wifi_connected) {
-        return "ok";
+    app_status_snapshot_t local = {
+        .last_frame_type = '-',
+    };
+
+    if (snapshot == NULL) {
+        return;
     }
 
-    return snapshot->wifi_started ? "connecting" : "stopped";
-}
+    app_status_copy_snapshot(&local);
 
-/**
- * @brief 将 MQTT 布尔状态转为单行可读字符串。
- *
- * 优先级: connected+subscribed → "ok"; connected 仅 → "connected";
- *         started → "starting"; 否则 → "stopped"
- */
-static const char *mqtt_state_string(const app_status_snapshot_t *snapshot)
-{
-    if (snapshot->mqtt_connected && snapshot->mqtt_subscribed) {
-        return "ok";
-    }
-
-    if (snapshot->mqtt_connected) {
-        return "connected";
-    }
-
-    return snapshot->mqtt_started ? "starting" : "stopped";
-}
-
-/**
- * @brief 将 UART 布尔状态转为单行可读字符串。
- *
- * 条件: 驱动就绪 + TX/RX 任务同时运行 → "ok";
- *       仅驱动就绪 → "partial"; 否则 → "stopped"
- */
-static const char *uart_state_string(const app_status_snapshot_t *snapshot)
-{
-    if (snapshot->uart_ready && snapshot->uart_tx_task_running && snapshot->uart_rx_task_running) {
-        return "ok";
-    }
-
-    if (snapshot->uart_ready) {
-        return "partial";
-    }
-
-    return "stopped";
-}
-
-/**
- * @brief 将协议解析状态转为单行可读字符串。
- *
- * 当尚未收到任何帧时（ok/error 均为 0）返回 "idle"；
- * 否则根据最近一帧的解析结果返回 "ok" 或 "error"。
- */
-static const char *protocol_state_string(const app_status_snapshot_t *snapshot)
-{
-    if (snapshot->protocol_ok == 0U && snapshot->protocol_error == 0U) {
-        return "idle";
-    }
-
-    return snapshot->last_protocol_ok ? "ok" : "error";
+    snapshot->wifi_started = local.wifi_started;
+    snapshot->wifi_connected = local.wifi_connected;
+    snapshot->mqtt_started = local.mqtt_started;
+    snapshot->mqtt_connected = local.mqtt_connected;
+    snapshot->mqtt_subscribed = local.mqtt_subscribed;
+    snapshot->uart_ready = local.uart_ready;
+    snapshot->uart_tx_task_running = local.uart_tx_task_running;
+    snapshot->uart_rx_task_running = local.uart_rx_task_running;
+    snapshot->last_protocol_ok = local.last_protocol_ok;
+    snapshot->last_frame_type = local.last_frame_type;
+    snapshot->last_frame_ms = local.last_frame_ms;
+    snapshot->uart_rx_lines = local.uart_rx_lines;
+    snapshot->uart_rx_drops = local.uart_rx_drops;
+    snapshot->uart_rx_overflows = local.uart_rx_overflows;
+    snapshot->uart_tx_queued = local.uart_tx_queued;
+    snapshot->uart_tx_ok = local.uart_tx_ok;
+    snapshot->uart_tx_fail = local.uart_tx_fail;
+    snapshot->mqtt_publish_ok = local.mqtt_publish_ok;
+    snapshot->mqtt_publish_fail = local.mqtt_publish_fail;
+    snapshot->mqtt_command_count = local.mqtt_command_count;
+    snapshot->protocol_ok = local.protocol_ok;
+    snapshot->protocol_error = local.protocol_error;
+    snapshot->forward_fail = local.forward_fail;
 }
 
 /**
